@@ -64,6 +64,10 @@
 #include <linux/gp2a.h>
 #endif
 
+#ifdef CONFIG_FORCE_FAST_CHARGE
+#include <linux/fastchg.h>
+#endif
+
 #define _CONFIG_MACH_JENA // Temporary flag
 #define _CONFIG_MACH_TREBON // Temporary flag
 
@@ -1482,8 +1486,17 @@ void trebon_chg_connected(enum chg_type chgtype)
 
 	switch (chgtype) {
 	case USB_CHG_TYPE__SDP:
+#ifdef CONFIG_FORCE_FAST_CHARGE
+    		if (force_fast_charge)
+				ret = msm_proc_comm(PCOM_CHG_USB_IS_CHARGER_CONNECTED,
+				data1, data2);
+			else
+				ret = msm_proc_comm(PCOM_CHG_USB_IS_PC_CONNECTED,
+				data1, data2);
+#else
 		ret = msm_proc_comm(PCOM_CHG_USB_IS_PC_CONNECTED,
 				data1, data2);
+#endif
 		break;
 	case USB_CHG_TYPE__WALLCHARGER:
 		ret = msm_proc_comm(PCOM_CHG_USB_IS_CHARGER_CONNECTED,
