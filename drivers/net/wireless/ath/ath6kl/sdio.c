@@ -69,6 +69,8 @@ struct ath6kl_sdio {
 #define CMD53_ARG_FIXED_ADDRESS 0
 #define CMD53_ARG_INCR_ADDRESS  1
 
+extern wait_queue_head_t init_wq;
+
 static inline struct ath6kl_sdio *ath6kl_sdio_priv(struct ath6kl *ar)
 {
 	return ar->hif_priv;
@@ -475,7 +477,6 @@ static void ath6kl_sdio_irq_handler(struct sdio_func *func)
 
 	status = ath6kl_hif_intr_bh_handler(ar_sdio->ar);
 	sdio_claim_host(ar_sdio->func);
-
 	atomic_set(&ar_sdio->irq_handling, 0);
 	wake_up(&ar_sdio->irq_wq);
 
@@ -597,7 +598,7 @@ static void ath6kl_sdio_irq_disable(struct ath6kl *ar)
 		sdio_release_host(ar_sdio->func);
 
 		ret = wait_event_interruptible(ar_sdio->irq_wq,
-					       ath6kl_sdio_is_on_irq(ar));
+				ath6kl_sdio_is_on_irq(ar));
 		if (ret)
 			return;
 
@@ -840,34 +841,12 @@ static int ath6kl_sdio_suspend(struct ath6kl *ar, struct cfg80211_wowlan *wow)
 	bool try_deepsleep = false;
 	int ret;
 
-	if (ar->state == ATH6KL_STATE_SCHED_SCAN) {
-		ath6kl_dbg(ATH6KL_DBG_SUSPEND, "sched scan is in progress\n");
-
-		ret = ath6kl_set_sdio_pm_caps(ar);
-		if (ret) {
-			ath6kl_err("%s() : Fail to set MMC_PM_KEEP_POWER or MMC_PM_WAKE_SDIO_IRQ : %d\n",
-						__func__, ret);
-			goto cut_pwr;
-		}
-
-		ret =  ath6kl_cfg80211_suspend(ar,
-					       ATH6KL_CFG_SUSPEND_SCHED_SCAN,
-					       NULL);
-		if (ret)
-			goto cut_pwr;
-
-		return 0;
-	}
-
 	if (ar->suspend_mode == WLAN_POWER_STATE_WOW ||
 	    (!ar->suspend_mode && wow)) {
 
 		ret = ath6kl_set_sdio_pm_caps(ar);
-		if (ret) {
-			ath6kl_err("%s() : Fail to set MMC_PM_KEEP_POWER or MMC_PM_WAKE_SDIO_IRQ : %d\n",
-						__func__, ret);
+		if (ret)
 			goto cut_pwr;
-		}
 
 		ret = ath6kl_cfg80211_suspend(ar, ATH6KL_CFG_SUSPEND_WOW, wow);
 		if (ret && ret != -ENOTCONN)
@@ -891,12 +870,8 @@ static int ath6kl_sdio_suspend(struct ath6kl *ar, struct cfg80211_wowlan *wow)
 			goto cut_pwr;
 
 		ret = sdio_set_host_pm_flags(func, MMC_PM_KEEP_POWER);
-		if (ret) {
-			ath6kl_err("%s() : Fail to set MMC_PM_KEEP_POWER : %d\n",
-						__func__ , ret);
+		if (ret)
 			goto cut_pwr;
-		}
-
 
 		/*
 		 * Workaround to support Deep Sleep with MSM, set the host pm
@@ -907,11 +882,8 @@ static int ath6kl_sdio_suspend(struct ath6kl *ar, struct cfg80211_wowlan *wow)
 		if ((flags & MMC_PM_WAKE_SDIO_IRQ)) {
 			ret = sdio_set_host_pm_flags(func,
 						MMC_PM_WAKE_SDIO_IRQ);
-			if (ret) {
-				ath6kl_err("%s() : Fail to set MMC_PM_KEEP_POWER : %d\n",
-							__func__, ret);
+			if (ret)
 				goto cut_pwr;
-			}
 		}
 
 		ret = ath6kl_cfg80211_suspend(ar, ATH6KL_CFG_SUSPEND_DEEPSLEEP,
@@ -950,13 +922,13 @@ static int ath6kl_sdio_resume(struct ath6kl *ar)
 	case ATH6KL_STATE_WOW:
 		break;
 
-	case ATH6KL_STATE_SCHED_SCAN:
-		break;
-
 	case ATH6KL_STATE_SUSPENDING:
 		break;
 
 	case ATH6KL_STATE_RESUMING:
+		break;
+
+	case ATH6KL_STATE_RECOVERY:
 		break;
 	}
 
@@ -1287,41 +1259,16 @@ static const struct ath6kl_hif_ops ath6kl_sdio_ops = {
  */
 static int ath6kl_sdio_pm_suspend(struct device *device)
 {
-#if 0
-    struct sdio_func *func;
-	struct ath6kl_sdio *ar_sdio;
-	int ret;
-	ath6kl_dbg(ATH6KL_DBG_SUSPEND, "sdio pm suspend\n");
-
-	func = dev_to_sdio_func(device);
-	ar_sdio = sdio_get_drvdata(func);
-
-	ret = ath6kl_sdio_suspend(ar_sdio->ar, NULL);
-
-	return ret;
-#else
 	ath6kl_dbg(ATH6KL_DBG_SUSPEND, "sdio pm suspend\n");
 
 	return 0;
-#endif
 }
 
 static int ath6kl_sdio_pm_resume(struct device *device)
 {
-#if 0
-    struct sdio_func *func;
-	struct ath6kl_sdio *ar_sdio;
-	ath6kl_dbg(ATH6KL_DBG_SUSPEND, "sdio pm resume\n");
-
-	func = dev_to_sdio_func(device);
-	ar_sdio = sdio_get_drvdata(func);
-
-	return ath6kl_sdio_resume(ar_sdio->ar);
-#else
 	ath6kl_dbg(ATH6KL_DBG_SUSPEND, "sdio pm resume\n");
 
 	return 0;
-#endif
 }
 
 static SIMPLE_DEV_PM_OPS(ath6kl_sdio_pm_ops, ath6kl_sdio_pm_suspend,
@@ -1401,11 +1348,13 @@ static int ath6kl_sdio_probe(struct sdio_func *func,
 	}
 
 	ret = ath6kl_core_init(ar);
+	ath6kl_info("Current ath6kl driver version is: 3.4.0.77\n");
 	if (ret) {
 		ath6kl_err("Failed to init ath6kl core\n");
 		goto err_core_alloc;
 	}
 
+	ath6kl_notify_init_done();
 	return ret;
 
 err_core_alloc:
@@ -1461,23 +1410,25 @@ static int __init ath6kl_sdio_init(void)
 {
 	int ret;
 
-    ath6kl_err("%s(): Enter\n", __func__);
+	ath6kl_sdio_init_platform();
 
-	ath6kl_sdio_init_msm();
+	init_waitqueue_head(&init_wq);
+
 	ret = sdio_register_driver(&ath6kl_sdio_driver);
-	if (ret)
+	if (ret) {
 		ath6kl_err("sdio driver registration failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = ath6kl_wait_for_init_comp();
 
 	return ret;
 }
 
 static void __exit ath6kl_sdio_exit(void)
 {
-    ath6kl_err("%s(): Enter\n", __func__);
-
 	sdio_unregister_driver(&ath6kl_sdio_driver);
-	ath6kl_sdio_exit_msm();
-
+	ath6kl_sdio_exit_platform();
 }
 
 module_init(ath6kl_sdio_init);

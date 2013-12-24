@@ -105,10 +105,10 @@ struct bt_power {
 #define BT_CHANNEL_POLICY_AMP_PREFERRED		2
 
 __printf(2, 3)
-//int bt_printk(const char *level, const char *fmt, ...);
+int bt_printk(const char *level, const char *fmt, ...);
 
-//#define BT_INFO(fmt, arg...)   bt_printk(KERN_INFO, pr_fmt(fmt), ##arg)
-//#define BT_ERR(fmt, arg...)    bt_printk(KERN_ERR, pr_fmt(fmt), ##arg)
+#define BT_INFO(fmt, arg...)   bt_printk(KERN_INFO, pr_fmt(fmt), ##arg)
+#define BT_ERR(fmt, arg...)    bt_printk(KERN_ERR, pr_fmt(fmt), ##arg)
 #define BT_DBG(fmt, arg...)    pr_debug(fmt "\n", ##arg)
 
 /* Connection and socket states */

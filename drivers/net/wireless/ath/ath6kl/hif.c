@@ -25,6 +25,8 @@
 
 #define ATH6KL_TIME_QUANTUM	10  /* in ms */
 
+int look_ahead_error_count = 0;
+
 static int ath6kl_hif_cp_scat_dma_buf(struct hif_scatter_req *req,
 				      bool from_dma)
 {
@@ -114,13 +116,97 @@ static void ath6kl_hif_dump_fw_crash(struct ath6kl *ar)
 
 }
 
+#define DUMP_MASK_FULL_STACK                   0x01
+#define DUMP_MASK_DBGLOG                       0x02
+
+#define AR6003_HW211_KERNELSTACK_BASE          0x543938
+#define AR6003_HW211_KERNELSTACK_SIZE          2560
+#define MAX_DUMP_BYTE_NUM_ONE_ITERATION        256
+#define DUMP_STACK_OFFSET                      0x40
+
+#define AR6003_HW211_DBGLOG_ADDR               0x543730
+#define AR6003_HW211_DBGLOG_SIZE               3300
+
+static void ath6kl_hif_dump(struct ath6kl *ar, u32 fw_dump_addr, u32 len)
+{
+	__le32 regdump_val[MAX_DUMP_BYTE_NUM_ONE_ITERATION / 4];
+	u32 read_len = 0;
+	u32 i = 0,count;
+	int ret;
+	u32 phy_addr = TARG_VTOP(ar->target_type, fw_dump_addr);
+
+	len = (len + 3) & (~0x3);
+	fw_dump_addr = (fw_dump_addr + 3) & (~0x3);
+
+	while(len) {
+		read_len = len;
+		if(read_len > MAX_DUMP_BYTE_NUM_ONE_ITERATION)
+			read_len = MAX_DUMP_BYTE_NUM_ONE_ITERATION;
+
+		phy_addr = TARG_VTOP(ar->target_type, fw_dump_addr);
+		ret = ath6kl_diag_read(ar, phy_addr, (u8 *) &regdump_val[0], read_len);
+		if (ret) {
+			ath6kl_warn("failed to get register dump: %d\n", ret);
+			return;
+		}
+
+		count = read_len / 4;
+		for (i = 0; i < count; i += 4) {
+			ath6kl_info("0x%08x: 0x%08x 0x%08x 0x%08x 0x%08x\n",
+				    le32_to_cpu(fw_dump_addr + 4 * i),
+				    le32_to_cpu(regdump_val[i]),
+				    le32_to_cpu(regdump_val[i + 1]),
+				    le32_to_cpu(regdump_val[i + 2]),
+				    le32_to_cpu(regdump_val[i + 3]));
+		}
+
+		len -= read_len;
+		fw_dump_addr += read_len;
+	}
+}
+
+static void ath6kl_hif_dump_fw_more(struct ath6kl *ar, u32 mask)
+{
+	u32 fw_dump_addr, fw_dump_len;
+	u32 address;
+	int ret;
+
+	if (ar->target_type != TARGET_TYPE_AR6003 ) {
+		ath6kl_warn("not support dump stack for type: %x\n", ar->target_type);
+		return;
+	}
+
+	if(mask & DUMP_MASK_FULL_STACK) {
+		if(ar->wiphy->hw_version == AR6003_HW_2_1_1_VERSION) {
+			fw_dump_addr = AR6003_HW211_KERNELSTACK_BASE - DUMP_STACK_OFFSET;
+			fw_dump_len = AR6003_HW211_KERNELSTACK_SIZE + DUMP_STACK_OFFSET;
+			ath6kl_warn("firmware stack:0x%x, len:0x%x\n",
+				    AR6003_HW211_KERNELSTACK_BASE,
+				    AR6003_HW211_KERNELSTACK_SIZE);
+			ath6kl_hif_dump(ar, fw_dump_addr, fw_dump_len);
+		}
+	}
+
+	if(mask & DUMP_MASK_DBGLOG) {
+		if(ar->wiphy->hw_version == AR6003_HW_2_1_1_VERSION) {
+			address = TARG_VTOP(ar->target_type,
+					    AR6003_HW211_DBGLOG_ADDR);
+			ret = ath6kl_diag_read32(ar, address, &fw_dump_addr);
+			if(!ret && fw_dump_addr) {
+				fw_dump_len = AR6003_HW211_DBGLOG_SIZE;
+				ath6kl_warn("fw dblog:0x%x, len:0x%x\n",
+					    fw_dump_addr,
+					    AR6003_HW211_DBGLOG_SIZE);
+				ath6kl_hif_dump(ar, fw_dump_addr, fw_dump_len);
+			}
+		}
+	}
+}
+
 static int ath6kl_hif_proc_dbg_intr(struct ath6kl_device *dev)
 {
 	u32 dummy;
 	int ret;
-	struct ath6kl_vif *vif;
-
-	vif = ath6kl_vif_first(dev->ar);
 
 	ath6kl_warn("firmware crashed\n");
 
@@ -134,9 +220,14 @@ static int ath6kl_hif_proc_dbg_intr(struct ath6kl_device *dev)
 		ath6kl_warn("Failed to clear debug interrupt: %d\n", ret);
 
 	ath6kl_hif_dump_fw_crash(dev->ar);
+	/*if (debug_mask & ATH6KL_DBG_STACK_DUMP)*/
+		ath6kl_hif_dump_fw_more(dev->ar, DUMP_MASK_FULL_STACK |
+					DUMP_MASK_DBGLOG);
 	ath6kl_read_fwlogs(dev->ar);
+	ath6kl_recovery_err_notify(dev->ar, ATH6KL_FW_ASSERT);
 
-	cfg80211_priv_event(vif->ndev, "HANG", GFP_ATOMIC);
+	panic("ath6kl_firmware crash");
+
 	return ret;
 }
 
@@ -397,8 +488,7 @@ static int proc_pending_irqs(struct ath6kl_device *dev, bool *done)
 	u8 host_int_status = 0;
 	u32 lk_ahd = 0;
 	u8 htc_mbox = 1 << HTC_MAILBOX;
-	struct ath6kl_vif *vif;
-	vif = ath6kl_vif_first(dev->ar);
+
 	ath6kl_dbg(ATH6KL_DBG_IRQ, "proc_pending_irqs: (dev: 0x%p)\n", dev);
 
 	/*
@@ -456,14 +546,12 @@ static int proc_pending_irqs(struct ath6kl_device *dev, bool *done)
 				rg = &dev->irq_proc_reg;
 				lk_ahd = le32_to_cpu(rg->rx_lkahd[HTC_MAILBOX]);
 				if (!lk_ahd) {
-					ath6kl_err("lookAhead is zero!\n");
-					cfg80211_priv_event(vif->ndev,
-					"HANG", GFP_ATOMIC);
-					ath6kl_hif_rx_control(dev, false);
-					ssleep(3);
-					status = -ENOMEM;
+					ath6kl_err("lookAhead is zero %d!\n", ++look_ahead_error_count);
+					if(look_ahead_error_count > 30) {
+						ath6kl_hif_rx_control(dev, false);
+						panic("lookAhead is zero!");
+					}
 				}
-
 			}
 		}
 	}
@@ -488,13 +576,14 @@ static int proc_pending_irqs(struct ath6kl_device *dev, bool *done)
 		 */
 		status = ath6kl_htc_rxmsg_pending_handler(dev->htc_cnxt,
 							  lk_ahd, &fetched);
-		if (status && status != -ECANCELED) {
-			cfg80211_priv_event(vif->ndev, "HANG", GFP_ATOMIC);
-			ath6kl_hif_rx_control(dev, false);
-			ssleep(3);
+		if (status) {
+			printk("%s() look_ahead_error_count = %d\n", __func__, ++look_ahead_error_count);
+			if (look_ahead_error_count > 30) {
+				ath6kl_hif_rx_control(dev, false);
+				panic("MsgPend, invalid endpoint in look-ahead");
+			}
 			goto out;
 		}
-
 
 		if (!fetched)
 			/*

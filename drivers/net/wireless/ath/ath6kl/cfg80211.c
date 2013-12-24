@@ -54,6 +54,8 @@ module_param(ath6kl_p2p, uint, 0644);
 	.max_power      = 30,                       \
 }
 
+#define DEFAULT_BG_SCAN_PERIOD 0xffff
+
 struct ath6kl_cfg80211_match_probe_ssid {
 	struct cfg80211_ssid ssid;
 	u8 flag;
@@ -143,20 +145,22 @@ static struct ieee80211_supported_band ath6kl_band_5ghz = {
 
 #define CCKM_KRK_CIPHER_SUITE 0x004096ff /* use for KRK */
 
+#define SSCAN_WAKELOCK_IN_SECOND 35
+
 /* returns true if scheduled scan was stopped */
 static bool __ath6kl_cfg80211_sscan_stop(struct ath6kl_vif *vif)
 {
 	struct ath6kl *ar = vif->ar;
 
-	if (ar->state != ATH6KL_STATE_SCHED_SCAN)
+	if (!test_and_clear_bit(SCHED_SCANNING, &vif->flags))
 		return false;
 
 	del_timer_sync(&vif->sched_scan_timer);
 
-	ath6kl_wmi_set_host_sleep_mode_cmd(ar->wmi, vif->fw_vif_idx,
-					   ATH6KL_HOST_MODE_AWAKE);
+	if (ar->state == ATH6KL_STATE_RECOVERY)
+		return true;
 
-	ar->state = ATH6KL_STATE_ON;
+	ath6kl_wmi_enable_sched_scan_cmd(ar->wmi, vif->fw_vif_idx, false);
 
 	return true;
 }
@@ -283,7 +287,7 @@ static void ath6kl_set_key_mgmt(struct ath6kl_vif *vif, u32 key_mgmt)
 	}
 }
 
-static bool ath6kl_cfg80211_ready(struct ath6kl_vif *vif)
+bool ath6kl_cfg80211_ready(struct ath6kl_vif *vif)
 {
 	struct ath6kl *ar = vif->ar;
 
@@ -424,7 +428,12 @@ static bool ath6kl_is_valid_iftype(struct ath6kl *ar, enum nl80211_iftype type,
 		}
 	}
 
+#ifdef SS_3RD_INTF	
+	*if_idx = 2;
+	return true;
+#else
 	return false;
+#endif
 }
 
 static int ath6kl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
@@ -615,6 +624,17 @@ static int ath6kl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 					vif->req_bssid, vif->ch_hint,
 					ar->connect_ctrl_flags, nw_subtype);
 
+	/* disable background scan if period is 0 */
+	if (sme->bg_scan_period == 0)
+		sme->bg_scan_period = 0xffff;
+
+	/* configure default value if not specified */
+	if (sme->bg_scan_period == -1)
+		sme->bg_scan_period = DEFAULT_BG_SCAN_PERIOD;
+
+	ath6kl_wmi_scanparams_cmd(ar->wmi, vif->fw_vif_idx, 0, 0,
+				  sme->bg_scan_period, 0, 0, 0, 3, 0, 0, 0);
+
 	up(&ar->sem);
 
 	if (status == -EINVAL) {
@@ -685,8 +705,8 @@ ath6kl_add_bss_if_needed(struct ath6kl_vif *vif,
 					  ie, 2 + vif->ssid_len + beacon_ie_len,
 					  0, GFP_KERNEL);
 		if (bss)
-			ath6kl_dbg(ATH6KL_DBG_WLAN_CFG, "added bss %s to "
-				   "cfg80211\n", sec_conv_mac(bssid));
+			ath6kl_dbg(ATH6KL_DBG_WLAN_CFG, "added bss %pM to "
+				   "cfg80211\n", bssid);
 		kfree(ie);
 	} else
 		ath6kl_dbg(ATH6KL_DBG_WLAN_CFG, "cfg80211 already has a bss\n");
@@ -960,8 +980,19 @@ static int ath6kl_cfg80211_scan(struct wiphy *wiphy, struct net_device *ndev,
 	int ret = 0;
 	u32 force_fg_scan = 0;
 
+#ifdef SS_3RD_INTF
+	if (vif->fw_vif_idx == 2) {
+		ar->scan_p2p = true;
+		ar->p2p_active = true;
+	}
+#endif
 	if (!ath6kl_cfg80211_ready(vif))
 		return -EIO;
+
+#define NUMBER_OF_SOCIAL_CHANNELS	3
+	if ((vif->fw_vif_idx == 1) &&
+		(request->n_channels > NUMBER_OF_SOCIAL_CHANNELS))
+		cfg80211_unlink_allbss(wiphy);
 
 	ath6kl_cfg80211_sscan_disable(vif);
 
@@ -995,7 +1026,6 @@ static int ath6kl_cfg80211_scan(struct wiphy *wiphy, struct net_device *ndev,
 	 * channels. If the list is longer than the target supports, do not
 	 * configure the list and instead, scan all available channels.
 	 */
-	ath6kl_err("channel num %d \n", request->n_channels);
 	if (request->n_channels > 0 &&
 	    request->n_channels <= WMI_MAX_CHANNELS) {
 		u8 i;
@@ -1019,35 +1049,27 @@ static int ath6kl_cfg80211_scan(struct wiphy *wiphy, struct net_device *ndev,
 	vif->scan_req = request;
 
 	if (test_bit(ATH6KL_FW_CAPABILITY_STA_P2PDEV_DUPLEX,
-		    ar->fw_capabilities)) {
-		/*
-		 * If capable of doing P2P mgmt operations using
-		 * station interface, send additional information like
-		 * supported rates to advertise and xmit rates for
-		 * probe requests
-		 */
+		     ar->fw_capabilities)) {
+
 		if (request->no_cck) {
 #ifdef CONFIG_HAS_WAKELOCK
 			ath6kl_p2p_release_wakelock(ar);
-			ath6kl_p2p_acquire_wakelock(ar , n_channels * 200);
+			ath6kl_p2p_acquire_wakelock(ar , n_channels *
+						    msecs_to_jiffies(110));
 #endif
 		}
-		ret = ath6kl_wmi_beginscan_cmd(ar->wmi, vif->fw_vif_idx,
-						WMI_LONG_SCAN, force_fg_scan,
-						false, 0,
-						ATH6KL_FG_SCAN_INTERVAL,
-						n_channels, channels,
-						request->no_cck,
-						request->rates);
-	} else {
-		ret = ath6kl_wmi_startscan_cmd(ar->wmi, vif->fw_vif_idx,
-						WMI_LONG_SCAN, force_fg_scan,
-						false, 0,
-						ATH6KL_FG_SCAN_INTERVAL,
-						n_channels, channels);
 	}
+
+	ret = ath6kl_wmi_beginscan_cmd(ar->wmi, vif->fw_vif_idx,
+				       WMI_LONG_SCAN, force_fg_scan,
+				       false, 0,
+				       ATH6KL_FG_SCAN_INTERVAL,
+				       n_channels, channels,
+				       request->no_cck,
+				       request->rates);
+
 	if (ret) {
-		ath6kl_err("wmi_startscan_cmd failed\n");
+		ath6kl_err("failed to start scan: %d\n", ret);
 		vif->scan_req = NULL;
 	}
 
@@ -1064,8 +1086,11 @@ void ath6kl_cfg80211_scan_complete_event(struct ath6kl_vif *vif, bool aborted)
 	ath6kl_dbg(ATH6KL_DBG_WLAN_CFG, "%s: status%s\n", __func__,
 		   aborted ? " aborted" : "");
 
-	if (!vif->scan_req)
+	spin_lock_bh(&vif->if_lock);
+	if (!vif->scan_req) {
+		spin_unlock_bh(&vif->if_lock);
 		return;
+	}
 
 	if (aborted)
 		goto out;
@@ -1081,6 +1106,9 @@ void ath6kl_cfg80211_scan_complete_event(struct ath6kl_vif *vif, bool aborted)
 out:
 	cfg80211_scan_done(vif->scan_req, aborted);
 	vif->scan_req = NULL;
+	spin_unlock_bh(&vif->if_lock);
+
+	return;
 }
 
 void ath6kl_cfg80211_ch_switch_notify(struct ath6kl_vif *vif, int freq,
@@ -1183,7 +1211,7 @@ static int ath6kl_cfg80211_add_key(struct wiphy *wiphy, struct net_device *ndev,
 
 	if (vif->nw_type == AP_NETWORK && !pairwise &&
 	    (key_type == TKIP_CRYPT || key_type == AES_CRYPT ||
-	     key_type == WAPI_CRYPT) && params) {
+	     key_type == WAPI_CRYPT)) {
 		ar->ap_mode_bkey.valid = true;
 		ar->ap_mode_bkey.key_index = key_index;
 		ar->ap_mode_bkey.key_type = key_type;
@@ -1492,10 +1520,12 @@ static struct net_device *ath6kl_cfg80211_add_iface(struct wiphy *wiphy,
 	struct net_device *ndev;
 	u8 if_idx, nw_type;
 
+#ifndef SS_3RD_INTF
 	if (ar->num_vif == ar->vif_max) {
 		ath6kl_err("Reached maximum number of supported vif\n");
 		return ERR_PTR(-EINVAL);
 	}
+#endif
 
 	if (!ath6kl_is_valid_iftype(ar, type, &if_idx, &nw_type)) {
 		ath6kl_err("Not a supported interface type\n");
@@ -1510,6 +1540,15 @@ static struct net_device *ath6kl_cfg80211_add_iface(struct wiphy *wiphy,
 
 	return ndev;
 }
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,0,0))
+struct net_device *ath6kl_cfg80211_add_p2p0_iface(struct ath6kl *ar)
+{
+	return ath6kl_cfg80211_add_iface(ar->wiphy, "p2p0",
+					 NL80211_IFTYPE_P2P_CLIENT,
+					 NULL, NULL);
+}
+#endif
 
 static int ath6kl_cfg80211_del_iface(struct wiphy *wiphy,
 				     struct net_device *ndev)
@@ -2078,12 +2117,11 @@ static int ath6kl_cfg80211_host_sleep(struct ath6kl *ar, struct ath6kl_vif *vif)
 	int ret, left;
 
 	clear_bit(HOST_SLEEP_MODE_CMD_PROCESSED, &vif->flags);
-	set_bit(NOTIFY_HSLEEP_EVT, &vif->flags);
 
 	ret = ath6kl_wmi_set_host_sleep_mode_cmd(ar->wmi, vif->fw_vif_idx,
 						 ATH6KL_HOST_MODE_ASLEEP);
 	if (ret)
-		goto hsleep_fail;
+		return ret;
 
 	left = wait_event_interruptible_timeout(ar->event_wq,
 						is_hsleep_mode_procsed(vif),
@@ -2109,63 +2147,24 @@ static int ath6kl_cfg80211_host_sleep(struct ath6kl *ar, struct ath6kl_vif *vif)
 			ret = left;
 		}
 	}
-hsleep_fail:
-	if (ret)
-		clear_bit(NOTIFY_HSLEEP_EVT, &vif->flags);
+
 	return ret;
 }
 
-static int ath6kl_get_conn_vif(struct ath6kl *ar, struct ath6kl_vif **vif)
+static int ath6kl_wow_suspend_vif(struct ath6kl_vif *vif,
+				  struct cfg80211_wowlan *wow, u32 *filter)
 {
-	struct ath6kl_vif *vif_temp;
-	bool connected = false;
-
-	list_for_each_entry(vif_temp, &ar->vif_list, list) {
-		if (test_bit(CONNECTED, &vif_temp->flags)) {
-			if (!connected) {
-				*vif = vif_temp;
-				connected = true;
-			} else
-				return -EIO;
-		}
-	}
-
-	if (!vif)
-		return -EIO;
-
-	if (!connected)
-		return -ENOTCONN;
-
-	return 0;
-}
-
-static int ath6kl_wow_suspend(struct ath6kl *ar, struct cfg80211_wowlan *wow)
-{
+	struct ath6kl *ar = vif->ar;
 	struct in_device *in_dev;
 	struct in_ifaddr *ifa;
-	struct ath6kl_vif *vif;
 	int ret;
-	u32 filter = 0;
 	u16 i, bmiss_time;
-	u8 index = 0;
 	__be32 ips[MAX_IP_ADDRS];
-
-	ret = ath6kl_get_conn_vif(ar, &vif);
-	if (ret)
-		return ret;
-
-	if (!ath6kl_cfg80211_ready(vif))
-		return -EIO;
-
-	if (!test_bit(CONNECTED, &vif->flags))
-		return -ENOTCONN;
-
-	if (wow && (wow->n_patterns > WOW_MAX_FILTERS_PER_LIST))
-		return -EINVAL;
+	u8 index = 0;
 
 	if (!test_bit(NETDEV_MCAST_ALL_ON, &vif->flags)) {
-		ret = ath6kl_wmi_mcast_filter_cmd(vif->ar->wmi,
-						vif->fw_vif_idx, false);
+		ret = ath6kl_wmi_mcast_filter_cmd(ar->wmi,
+						  vif->fw_vif_idx, false);
 		if (ret)
 			return ret;
 	}
@@ -2181,7 +2180,7 @@ static int ath6kl_wow_suspend(struct ath6kl *ar, struct cfg80211_wowlan *wow)
 	 * the user.
 	 */
 	if (wow)
-		ret = ath6kl_wow_usr(ar, vif, wow, &filter);
+		ret = ath6kl_wow_usr(ar, vif, wow, filter);
 	else if (vif->nw_type == AP_NETWORK)
 		ret = ath6kl_wow_ap(ar, vif);
 	else
@@ -2216,12 +2215,10 @@ static int ath6kl_wow_suspend(struct ath6kl *ar, struct cfg80211_wowlan *wow)
 			return ret;
 	}
 
-	ar->state = ATH6KL_STATE_SUSPENDING;
-
 	/* Setup own IP addr for ARP agent. */
 	in_dev = __in_dev_get_rtnl(vif->ndev);
 	if (!in_dev)
-		goto skip_arp;
+		return 0;
 
 	ifa = in_dev->ifa_list;
 	memset(&ips, 0, sizeof(ips));
@@ -2244,80 +2241,91 @@ static int ath6kl_wow_suspend(struct ath6kl *ar, struct cfg80211_wowlan *wow)
 		return ret;
 	}
 
-	/* Save the current power mode before enabling power save */
-	ar->wmi->saved_pwr_mode = ar->wmi->pwr_mode;
+	return ret;
+}
 
-	ret = ath6kl_wmi_powermode_cmd(ar->wmi, 0, REC_POWER);
-	if (ret)
+static int ath6kl_wow_suspend(struct ath6kl *ar, struct cfg80211_wowlan *wow)
+{
+	struct ath6kl_vif *first_vif, *vif;
+	int ret = 0;
+	u32 filter = 0;
+	bool connected = false, sscan = false;
+
+	/* enter / leave wow suspend on first vif always */
+	first_vif = ath6kl_vif_first(ar);
+	if (WARN_ON(unlikely(!first_vif)) ||
+	    !ath6kl_cfg80211_ready(first_vif))
+		return -EIO;
+
+	if (wow && (wow->n_patterns > WOW_MAX_FILTERS_PER_LIST))
+		return -EINVAL;
+
+	/* install filters for each connected vif */
+	spin_lock_bh(&ar->list_lock);
+	list_for_each_entry(vif, &ar->vif_list, list) {
+		if (!test_bit(CONNECTED, &vif->flags) ||
+		    !ath6kl_cfg80211_ready(vif)) {
+			/* if a sscan is going on, do not clear
+			   WOW_FILTER_SSID later */
+			if (test_bit(SCHED_SCANNING, &vif->flags)) {
+				filter |= WOW_FILTER_SSID;
+				sscan = true;
+			}
+			continue;
+		}
+
+		connected = true;
+
+		spin_unlock_bh(&ar->list_lock);
+		ret = ath6kl_wow_suspend_vif(vif, wow, &filter);
+		spin_lock_bh(&ar->list_lock);
+		if (ret)
+			break;
+	}
+	spin_unlock_bh(&ar->list_lock);
+
+	/* to enable pno, goes into wow while sscan */
+	if (!connected && !sscan)
+		return -ENOTCONN;
+	else if (ret)
 		return ret;
 
-skip_arp:
-	ret = ath6kl_wmi_set_wow_mode_cmd(ar->wmi, vif->fw_vif_idx,
+	ar->state = ATH6KL_STATE_SUSPENDING;
+
+	ret = ath6kl_wmi_set_wow_mode_cmd(ar->wmi, first_vif->fw_vif_idx,
 					  ATH6KL_WOW_MODE_ENABLE,
 					  filter,
 					  WOW_HOST_REQ_DELAY);
 	if (ret)
 		return ret;
 
-	ret = ath6kl_cfg80211_host_sleep(ar, vif);
-	if (ret)
-		return ret;
-
-	return 0;
+	return ath6kl_cfg80211_host_sleep(ar, first_vif);
 }
 
-static int ath6kl_wow_resume(struct ath6kl *ar)
+static int ath6kl_wow_resume_vif(struct ath6kl_vif *vif)
 {
-	struct ath6kl_vif *vif;
+	struct ath6kl *ar = vif->ar;
 	int ret;
-
-	ret = ath6kl_get_conn_vif(ar, &vif);
-	if (ret)
-		return ret;
-
-#ifdef CONFIG_HAS_WAKELOCK
-	wake_lock_timeout(&ar->wake_lock, HZ);
-#endif
-	ar->state = ATH6KL_STATE_RESUMING;
-
-	if (ar->wmi->pwr_mode != ar->wmi->saved_pwr_mode) {
-		ret = ath6kl_wmi_powermode_cmd(ar->wmi, 0,
-					       ar->wmi->saved_pwr_mode);
-		if (ret)
-			return ret;
-	}
-
-	ret = ath6kl_wmi_set_host_sleep_mode_cmd(ar->wmi, vif->fw_vif_idx,
-						 ATH6KL_HOST_MODE_AWAKE);
-	if (ret) {
-		ath6kl_warn("Failed to configure host sleep mode for "
-			    "wow resume: %d\n", ret);
-		ar->state = ATH6KL_STATE_WOW;
-		return ret;
-	}
 
 	if (vif->nw_type != AP_NETWORK) {
 		ret = ath6kl_wmi_scanparams_cmd(ar->wmi, vif->fw_vif_idx,
-				0, 0, 0, 0, 0, 0, 3, 0, 0, 0);
+						0, 0, 0, 0, 0, 0, 3, 0, 0, 0);
 		if (ret)
 			return ret;
 
 		ret = ath6kl_wmi_listeninterval_cmd(ar->wmi, vif->fw_vif_idx,
-				vif->listen_intvl_t, 0);
+						    vif->listen_intvl_t, 0);
 		if (ret)
 			return ret;
 
 		ret = ath6kl_wmi_bmisstime_cmd(ar->wmi, vif->fw_vif_idx,
-				vif->bmiss_time_t, 0);
+					       vif->bmiss_time_t, 0);
 		if (ret)
 			return ret;
 	}
-
-	ar->state = ATH6KL_STATE_ON;
-
 	if (!test_bit(NETDEV_MCAST_ALL_OFF, &vif->flags)) {
 		ret = ath6kl_wmi_mcast_filter_cmd(vif->ar->wmi,
-					vif->fw_vif_idx, true);
+						  vif->fw_vif_idx, true);
 		if (ret)
 			return ret;
 	}
@@ -2325,6 +2333,71 @@ static int ath6kl_wow_resume(struct ath6kl *ar)
 	netif_wake_queue(vif->ndev);
 
 	return 0;
+}
+
+static int ath6kl_wow_resume(struct ath6kl *ar)
+{
+	struct ath6kl_vif *vif, *vif_p;
+	int ret;
+	bool sscan = false;
+
+	vif = ath6kl_vif_first(ar);
+	if (WARN_ON(unlikely(!vif)) ||
+	    !ath6kl_cfg80211_ready(vif))
+		return -EIO;
+
+#ifdef CONFIG_HAS_WAKELOCK
+	spin_lock_bh(&ar->list_lock);
+	list_for_each_entry(vif_p, &ar->vif_list, list) {
+		if (test_bit(SCHED_SCANNING, &vif_p->flags)) {
+			sscan = true;
+			break;
+		}
+	}
+	spin_unlock_bh(&ar->list_lock);
+
+	if (sscan) {
+		ath6kl_dbg(ATH6KL_DBG_SUSPEND, "sched scan %ds(%d jiffies) wake lock\n",
+			SSCAN_WAKELOCK_IN_SECOND, SSCAN_WAKELOCK_IN_SECOND*HZ);
+		wake_lock_timeout(&ar->wake_lock,
+			SSCAN_WAKELOCK_IN_SECOND * HZ);
+	} else {
+		wake_lock_timeout(&ar->wake_lock, 5);
+	}
+#endif
+
+	ar->state = ATH6KL_STATE_RESUMING;
+
+	ret = ath6kl_wmi_set_host_sleep_mode_cmd(ar->wmi, vif->fw_vif_idx,
+						 ATH6KL_HOST_MODE_AWAKE);
+	if (ret) {
+		ath6kl_warn("Failed to configure host sleep mode for "
+			    "wow resume: %d\n", ret);
+		goto cleanup;
+	}
+
+	spin_lock_bh(&ar->list_lock);
+	list_for_each_entry(vif, &ar->vif_list, list) {
+		if (!test_bit(CONNECTED, &vif->flags) ||
+		    !ath6kl_cfg80211_ready(vif))
+			continue;
+		spin_unlock_bh(&ar->list_lock);
+		ret = ath6kl_wow_resume_vif(vif);
+		spin_lock_bh(&ar->list_lock);
+		if (ret)
+			break;
+	}
+	spin_unlock_bh(&ar->list_lock);
+
+	if (ret)
+		goto cleanup;
+
+	ar->state = ATH6KL_STATE_ON;
+	return 0;
+
+cleanup:
+	ar->state = ATH6KL_STATE_WOW;
+	return ret;
 }
 
 static int ath6kl_cfg80211_deepsleep_suspend(struct ath6kl *ar)
@@ -2408,8 +2481,6 @@ int ath6kl_cfg80211_suspend(struct ath6kl *ar,
 	enum ath6kl_state prev_state;
 	int ret;
 
-	ath6kl_dbg(ATH6KL_DBG_SUSPEND, "%s(): mode = %d\n", __func__, mode);
-
 	switch (mode) {
 	case ATH6KL_CFG_SUSPEND_WOW:
 
@@ -2418,22 +2489,13 @@ int ath6kl_cfg80211_suspend(struct ath6kl *ar,
 		/* Flush all non control pkts in TX path */
 		ath6kl_tx_data_cleanup(ar);
 
-		vif = ath6kl_vif_first(ar);
-		if (!vif)
-			return -EIO;
-
-		ret = ath6kl_wmi_mcast_filter_cmd(vif->ar->wmi, vif->fw_vif_idx,
-							false);
-		if (ret)
-			return ret;
-
 		prev_state = ar->state;
 		ret = ath6kl_wow_suspend(ar, wow);
 		if (ret) {
 			ar->state = prev_state;
 			return ret;
 		}
-		set_bit(WOW_RESUME_PRINT, &ar->flag);
+
 		ar->state = ATH6KL_STATE_WOW;
 		break;
 
@@ -2473,13 +2535,6 @@ int ath6kl_cfg80211_suspend(struct ath6kl *ar,
 
 		break;
 
-	case ATH6KL_CFG_SUSPEND_SCHED_SCAN:
-		/*
-		 * Nothing needed for schedule scan, firmware is already in
-		 * wow mode and sleeping most of the time.
-		 */
-		break;
-
 	default:
 		break;
 	}
@@ -2493,7 +2548,6 @@ int ath6kl_cfg80211_suspend(struct ath6kl *ar,
 int ath6kl_cfg80211_resume(struct ath6kl *ar)
 {
 	int ret;
-	struct ath6kl_vif *vif;
 
 	switch (ar->state) {
 	case  ATH6KL_STATE_WOW:
@@ -2504,16 +2558,6 @@ int ath6kl_cfg80211_resume(struct ath6kl *ar)
 			ath6kl_warn("wow mode resume failed: %d\n", ret);
 			return ret;
 		}
-
-		vif = ath6kl_vif_first(ar);
-		if (!vif)
-			return -EIO;
-
-		ret = ath6kl_wmi_mcast_filter_cmd(vif->ar->wmi, vif->fw_vif_idx,
-									true);
-
-		if (ret)
-			return ret;
 
 		break;
 
@@ -2537,13 +2581,6 @@ int ath6kl_cfg80211_resume(struct ath6kl *ar)
 		}
 		break;
 
-	case ATH6KL_STATE_SCHED_SCAN:
-#ifdef CONFIG_HAS_WAKELOCK
-		ath6kl_dbg(ATH6KL_DBG_SUSPEND, "sched scan 30s wake lock\n");
-		wake_lock_timeout(&ar->wake_lock, 30 * HZ);
-#endif
-		break;
-
 	default:
 		break;
 	}
@@ -2557,24 +2594,25 @@ int ath6kl_cfg80211_resume(struct ath6kl *ar)
 static int __ath6kl_cfg80211_suspend(struct wiphy *wiphy,
 				 struct cfg80211_wowlan *wow)
 {
-#if 0
-	return 0;
-#else
 	struct ath6kl *ar = wiphy_priv(wiphy);
 
+	ath6kl_recovery_suspend(ar);
+
 	return ath6kl_hif_suspend(ar, wow);
-#endif
 }
 
 static int __ath6kl_cfg80211_resume(struct wiphy *wiphy)
 {
-#if 0
-	return 0;
-#else
 	struct ath6kl *ar = wiphy_priv(wiphy);
+	int err;
 
-	return ath6kl_hif_resume(ar);
-#endif
+	err = ath6kl_hif_resume(ar);
+	if (err)
+		return err;
+
+	ath6kl_recovery_resume(ar);
+
+	return 0;
 }
 
 /*
@@ -2596,21 +2634,10 @@ static int __ath6kl_cfg80211_resume(struct wiphy *wiphy)
 void ath6kl_check_wow_status(struct ath6kl *ar, struct sk_buff *skb,
 			     bool is_event_pkt)
 {
-
-	if (in_interrupt()) {
-		ath6kl_dbg(ATH6KL_DBG_SUSPEND,
-			"%s() called in sw interrupt context\n", __func__);
+	if (ar->state == ATH6KL_STATE_SUSPENDING)
 		return;
-	}
 
-	if (ar->state == ATH6KL_STATE_SUSPENDING) {
-		ath6kl_dbg(ATH6KL_DBG_SUSPEND,
-			"%s() received IRQ while we are WoW suspending\n",
-			__func__);
-		return;
-	}
-
-	if (ar->state == ATH6KL_STATE_WOW || ar->state == ATH6KL_STATE_SCHED_SCAN)
+	if (ar->state == ATH6KL_STATE_WOW)
 		ath6kl_cfg80211_resume(ar);
 	else
 		ath6kl_config_suspend_wake_lock(ar, skb, is_event_pkt);
@@ -2625,12 +2652,9 @@ void ath6kl_check_wow_status(struct ath6kl *ar, struct sk_buff *skb,
 #endif
 
 static int ath6kl_set_htcap(struct ath6kl_vif *vif, enum ieee80211_band band,
-			    bool ht_enable)
+			    bool ht_enable, bool ht40_support)
 {
 	struct ath6kl_htcap *htcap = &vif->htcap[band];
-
-	if (htcap->ht_enable == ht_enable)
-		return 0;
 
 	if (ht_enable) {
 		/* Set default ht capabilities */
@@ -2638,6 +2662,11 @@ static int ath6kl_set_htcap(struct ath6kl_vif *vif, enum ieee80211_band band,
 		htcap->cap_info = (band == IEEE80211_BAND_2GHZ) ?
 				   ath6kl_g_htcap : ath6kl_a_htcap;
 		htcap->ampdu_factor = IEEE80211_HT_MAX_AMPDU_16K;
+		/*disable ht40*/
+		if (!ht40_support) {
+			htcap->cap_info &= ~(IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
+					     IEEE80211_HT_CAP_SGI_40);
+		}
 	} else /* Disable ht */
 		memset(htcap, 0, sizeof(*htcap));
 
@@ -2722,8 +2751,10 @@ static int ath6kl_ap_beacon(struct wiphy *wiphy, struct net_device *dev,
 {
 	struct ath6kl *ar = ath6kl_priv(dev);
 	struct ath6kl_vif *vif = netdev_priv(dev);
+	struct ath6kl_vif_bcn_info *bcn_info = &vif->bcn_info;
 	struct ieee80211_mgmt *mgmt;
-	bool hidden = false;
+	enum wmi_phy_mode phy_mode;
+	bool hidden = false, is_ht40;
 	u8 *ies;
 	int ies_len;
 	struct wmi_connect_cmd p;
@@ -2741,6 +2772,10 @@ static int ath6kl_ap_beacon(struct wiphy *wiphy, struct net_device *dev,
 
 	if (vif->next_mode != AP_NETWORK)
 		return -EOPNOTSUPP;
+#ifdef SS_3RD_INTF
+	if (vif->fw_vif_idx == 2)
+		ar->p2p_active = true;
+#endif
 
 	/* this also clears IE in fw if it's not set */
 	res = ath6kl_wmi_set_appie_cmd(ar->wmi, vif->fw_vif_idx,
@@ -2788,6 +2823,8 @@ static int ath6kl_ap_beacon(struct wiphy *wiphy, struct net_device *dev,
 	vif->ssid_len = info->ssid_len;
 	if (info->hidden_ssid != NL80211_HIDDEN_SSID_NOT_IN_USE)
 		hidden = true;
+
+	bcn_info->hidden_ssid = hidden;
 
 	res = ath6kl_wmi_ap_hidden_ssid(ar->wmi, vif->fw_vif_idx, hidden);
 	if (res)
@@ -2868,6 +2905,12 @@ static int ath6kl_ap_beacon(struct wiphy *wiphy, struct net_device *dev,
 	p.ssid_len = vif->ssid_len;
 	memcpy(p.ssid, vif->ssid, vif->ssid_len);
 	p.dot11_auth_mode = vif->dot11_auth_mode;
+
+	if (info->auto_channel_select) {
+		ar->want_ch_switch |= 1 << vif->fw_vif_idx;
+		vif->next_chan = info->auto_channel_select - 1;
+	}
+
 	p.ch = cpu_to_le16(vif->next_chan);
 
 	/*
@@ -2911,6 +2954,7 @@ static int ath6kl_ap_beacon(struct wiphy *wiphy, struct net_device *dev,
 			res = ath6kl_wmi_set_ie_cmd(ar->wmi, vif->fw_vif_idx,
 				WLAN_EID_RSN, WMI_RSN_IE_CAPB,
 				(const u8 *)&rsn_capb, sizeof(rsn_capb));
+		vif->rsn_capab = rsn_capb;
 			if (res < 0)
 				return res;
 		}
@@ -2931,14 +2975,106 @@ static int ath6kl_ap_beacon(struct wiphy *wiphy, struct net_device *dev,
 		p.nw_subtype = SUBTYPE_NONE;
 	}
 
+	is_ht40 = (vif->next_ch_type == NL80211_CHAN_HT40MINUS ||
+		   vif->next_ch_type == NL80211_CHAN_HT40PLUS);
 	if (ath6kl_set_htcap(vif, vif->next_ch_band,
-			     vif->next_ch_type != NL80211_CHAN_NO_HT))
+			     vif->next_ch_type != NL80211_CHAN_NO_HT, is_ht40))
 		return -EIO;
 
+	if (test_bit(ATH6KL_FW_CAPABILITY_MAC_ACL, ar->fw_capabilities)) {
+		res = ath6kl_wmi_set_acl_policy(ar->wmi, vif->fw_vif_idx,
+						info->acl_mac);
+		if (res < 0)
+			return res;
+	}
+
+	if (!info->sta_cap_req)
+		goto ap_commit;
+
+	switch (info->sta_cap_req) {
+	case NL80211_STA_CAP_REQ_11BONLY:
+		phy_mode = WMI_11B_MODE;
+		break;
+	case NL80211_STA_CAP_REQ_11GONLY:
+		phy_mode = WMI_11GONLY_MODE;
+		break;
+	default:
+		ath6kl_err("STA capability requirement %d is not supported in AP mode\n",
+			   info->sta_cap_req);
+		return -ENOTSUPP;
+	}
+
+	bcn_info->phy_mode = phy_mode;
+	bcn_info->sta_cap_req = info->sta_cap_req;
+
+	res = ath6kl_wmi_set_ch_params(ar->wmi, vif->fw_vif_idx, phy_mode);
+	if (res)
+		return res;
+
+ap_commit:
 	memcpy(&vif->profile, &p, sizeof(p));
 	res = ath6kl_wmi_ap_profile_commit(ar->wmi, vif->fw_vif_idx, &p);
 	if (res < 0)
 		return res;
+
+	if (info->beacon_ies_len) {
+		if (bcn_info->beacon_ies)
+			bcn_info->beacon_ies = krealloc(bcn_info->beacon_ies,
+							info->beacon_ies_len,
+							GFP_KERNEL);
+		else
+			bcn_info->beacon_ies = kmalloc(info->beacon_ies_len,
+						       GFP_KERNEL);
+
+		if (!bcn_info->beacon_ies) {
+			ath6kl_warn("Failed to allocate memory to store beacon ies\n");
+			return 0;
+		}
+
+		memcpy(bcn_info->beacon_ies, info->beacon_ies,
+		       info->beacon_ies_len);
+		bcn_info->beacon_ies_len = info->beacon_ies_len;
+	}
+
+	if (info->proberesp_ies_len) {
+		if (bcn_info->proberesp_ies)
+			bcn_info->proberesp_ies =
+					krealloc(bcn_info->proberesp_ies,
+						 info->proberesp_ies_len,
+						 GFP_KERNEL);
+		else
+			bcn_info->proberesp_ies =
+					kmalloc(info->proberesp_ies_len,
+						GFP_KERNEL);
+		if (!bcn_info->proberesp_ies) {
+			ath6kl_warn("Failed to allocate memory to store probe resp ies\n");
+			return 0;
+		}
+
+		memcpy(bcn_info->proberesp_ies, info->proberesp_ies,
+		       info->proberesp_ies_len);
+		bcn_info->proberesp_ies_len = info->proberesp_ies_len;
+	}
+
+	if (info->assocresp_ies_len) {
+		if (bcn_info->assocresp_ies)
+			bcn_info->assocresp_ies =
+					krealloc(bcn_info->assocresp_ies,
+						 info->assocresp_ies_len,
+						 GFP_KERNEL);
+		else
+			bcn_info->assocresp_ies =
+					kmalloc(info->assocresp_ies_len,
+						GFP_KERNEL);
+		if (!bcn_info->assocresp_ies) {
+			ath6kl_warn("Failed to allocate memory to store assoc resp ies\n");
+			return 0;
+		}
+
+		memcpy(bcn_info->assocresp_ies, info->assocresp_ies,
+		       info->assocresp_ies_len);
+		bcn_info->assocresp_ies_len = info->assocresp_ies_len;
+	}
 
 	return 0;
 }
@@ -2947,14 +3083,14 @@ void ath6kl_cfg80211_sta_bmiss_enhance(struct ath6kl_vif *vif, bool enable)
 {
 	int err;
 
+	if (!test_bit(ATH6KL_FW_CAPABILITY_BMISS_ENHANCE,
+		      vif->ar->fw_capabilities))
+		return;
+
 	if (WARN_ON(!test_bit(WMI_READY, &vif->ar->flag)))
 		return;
 
 	if (vif->nw_type != INFRA_NETWORK)
-		return;
-
-	if (!test_bit(ATH6KL_FW_CAPABILITY_BMISS_ENHANCE,
-		      vif->ar->fw_capabilities))
 		return;
 
 	ath6kl_dbg(ATH6KL_DBG_WLAN_CFG, "%s fw bmiss enhance\n",
@@ -2983,6 +3119,14 @@ static int ath6kl_del_beacon(struct wiphy *wiphy, struct net_device *dev)
 {
 	struct ath6kl *ar = ath6kl_priv(dev);
 	struct ath6kl_vif *vif = netdev_priv(dev);
+	struct ath6kl_vif_bcn_info *bcn_info = &vif->bcn_info;
+
+	kfree(bcn_info->beacon_ies);
+	kfree(bcn_info->proberesp_ies);
+	kfree(bcn_info->assocresp_ies);
+	bcn_info->beacon_ies = NULL;
+	bcn_info->proberesp_ies = NULL;
+	bcn_info->assocresp_ies = NULL;
 
 	if (vif->nw_type != AP_NETWORK)
 		return -EOPNOTSUPP;
@@ -2993,14 +3137,89 @@ static int ath6kl_del_beacon(struct wiphy *wiphy, struct net_device *dev)
 	clear_bit(CONNECTED, &vif->flags);
 
 	/* Restore ht setting in firmware */
-	if (ath6kl_set_htcap(vif, IEEE80211_BAND_2GHZ, true))
+	if (ath6kl_set_htcap(vif, IEEE80211_BAND_2GHZ, true, true))
 		return -EIO;
 
-	if (ath6kl_set_htcap(vif, IEEE80211_BAND_5GHZ, true))
+	if (ath6kl_set_htcap(vif, IEEE80211_BAND_5GHZ, true, true))
 		return -EIO;
 
 	return 0;
 }
+
+void ath6kl_cfg80211_start_ap(struct ath6kl_vif *vif)
+{
+	struct ath6kl_vif_bcn_info *info = &vif->bcn_info;
+	struct ath6kl *ar = vif->ar;
+	bool is_ht40;
+
+
+	if (!ath6kl_cfg80211_ready(vif))
+		return;
+
+	/* this also clears IE in fw if it's not set */
+	if (ath6kl_wmi_set_appie_cmd(ar->wmi, vif->fw_vif_idx,
+				     WMI_FRAME_BEACON, info->beacon_ies,
+				     info->beacon_ies_len))
+		return;
+
+	/* this also clears IE in fw if it's not set */
+	if (ath6kl_set_ap_probe_resp_ies(vif, info->proberesp_ies,
+					 info->proberesp_ies_len))
+		return;
+
+	/* this also clears IE in fw if it's not set */
+	if (ath6kl_wmi_set_appie_cmd(ar->wmi, vif->fw_vif_idx,
+				     WMI_FRAME_ASSOC_RESP, info->assocresp_ies,
+				     info->assocresp_ies_len))
+		return;
+
+	if (ath6kl_wmi_ap_hidden_ssid(ar->wmi, vif->fw_vif_idx,
+				      info->hidden_ssid))
+		return;
+
+	if ((vif->profile.auth_mode & (WPA2_AUTH | WPA2_PSK_AUTH)) &&
+	    test_bit(ATH6KL_FW_CAPABILITY_RSN_CAP_OVERRIDE,
+		     ar->fw_capabilities)) {
+		if (ath6kl_wmi_set_ie_cmd(ar->wmi, vif->fw_vif_idx,
+					  WLAN_EID_RSN, WMI_RSN_IE_CAPB,
+					  (const u8 *) &vif->rsn_capab,
+					  sizeof(vif->rsn_capab)))
+			return;
+	}
+
+	/* Enable uAPSD support by default */
+	if (ath6kl_wmi_ap_set_apsd(ar->wmi, vif->fw_vif_idx, true))
+		return;
+
+	is_ht40 = (vif->next_ch_type == NL80211_CHAN_HT40MINUS ||
+		   vif->next_ch_type == NL80211_CHAN_HT40PLUS);
+	if (ath6kl_set_htcap(vif, vif->next_ch_band,
+			     vif->next_ch_type != NL80211_CHAN_NO_HT, is_ht40))
+		return;
+
+
+	if (info->sta_cap_req) {
+		if (ath6kl_wmi_set_ch_params(ar->wmi, vif->fw_vif_idx,
+					     info->phy_mode))
+			return;
+	}
+
+	ath6kl_wmi_ap_profile_commit(ar->wmi, vif->fw_vif_idx, &vif->profile);
+
+	/* TODO: Configure ACL MAC list */
+}
+
+void ath6kl_cfg80211_start_all(struct ath6kl *ar)
+{
+	struct ath6kl_vif *vif;
+
+	list_for_each_entry(vif, &ar->vif_list, list) {
+		if (vif->next_mode == AP_NETWORK &&
+		    vif->wdev.iftype != NL80211_IFTYPE_P2P_GO)
+			ath6kl_cfg80211_start_ap(vif);
+	}
+}
+
 
 static const u8 bcast_addr[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
@@ -3010,6 +3229,18 @@ static int ath6kl_del_station(struct wiphy *wiphy, struct net_device *dev,
 	struct ath6kl *ar = ath6kl_priv(dev);
 	struct ath6kl_vif *vif = netdev_priv(dev);
 	const u8 *addr = mac ? mac : bcast_addr;
+
+	if (!ath6kl_cfg80211_ready(vif))
+		return -EIO;
+
+	if(memcmp(addr, bcast_addr, ETH_ALEN)==0){
+		if(ath6kl_if_pending_wmi(ar, vif)){
+			vif->remove_sta_recall |= PENDING_WMI_CMD;
+			return 0;
+		}
+	}
+
+	vif->remove_sta_recall &= ~DTIM_EXPIRE_WMI_CMD; 
 
 	return ath6kl_wmi_ap_set_mlme(ar->wmi, vif->fw_vif_idx, WMI_AP_DEAUTH,
 				      addr, WLAN_REASON_PREV_AUTH_NOT_VALID);
@@ -3211,6 +3442,9 @@ static int ath6kl_mgmt_tx(struct wiphy *wiphy, struct net_device *dev,
 	const struct ieee80211_mgmt *mgmt;
 	bool more_data, queued;
 
+	if (!ath6kl_cfg80211_ready(vif))
+		return -EIO;
+
 	mgmt = (const struct ieee80211_mgmt *) buf;
 	if (vif->nw_type == AP_NETWORK && test_bit(CONNECTED, &vif->flags) &&
 	    ieee80211_is_probe_resp(mgmt->frame_control) &&
@@ -3275,7 +3509,7 @@ static int ath6kl_cfg80211_sscan_start(struct wiphy *wiphy,
 	struct ath6kl *ar = ath6kl_priv(dev);
 	struct ath6kl_vif *vif = netdev_priv(dev);
 	u16 interval;
-	int ret;
+	int ret, rssi_thold;
 
 	if (ar->state != ATH6KL_STATE_ON)
 		return -EIO;
@@ -3304,21 +3538,29 @@ static int ath6kl_cfg80211_sscan_start(struct wiphy *wiphy,
 			return ret;
 	}
 
+	if (test_bit(ATH6KL_FW_CAPABILITY_RSSI_SCAN_THOLD,
+		     ar->fw_capabilities)) {
+		if (request->rssi_thold <= NL80211_SCAN_RSSI_THOLD_OFF)
+			rssi_thold = 0;
+		else if (request->rssi_thold < -127)
+			rssi_thold = -127;
+		else
+			rssi_thold = request->rssi_thold;
+
+		ret = ath6kl_wmi_set_rssi_filter_cmd(ar->wmi, vif->fw_vif_idx,
+						     rssi_thold);
+		if (ret) {
+			ath6kl_err("failed to set RSSI threshold for scan\n");
+			return ret;
+		}
+	}
+
 	/* fw uses seconds, also make sure that it's >0 */
 	interval = max_t(u16, 1, request->interval / 1000);
 
 	ath6kl_wmi_scanparams_cmd(ar->wmi, vif->fw_vif_idx,
 				  interval, interval,
 				  vif->bg_scan_period, 0, 0, 0, 3, 0, 0, 0);
-
-	ret = ath6kl_wmi_set_wow_mode_cmd(ar->wmi, vif->fw_vif_idx,
-					  ATH6KL_WOW_MODE_ENABLE,
-					  WOW_FILTER_SSID,
-					  WOW_HOST_REQ_DELAY);
-	if (ret) {
-		ath6kl_warn("Failed to enable wow with ssid filter: %d\n", ret);
-		return ret;
-	}
 
 	/* this also clears IE in fw if it's not set */
 	ret = ath6kl_wmi_set_appie_cmd(ar->wmi, vif->fw_vif_idx,
@@ -3330,17 +3572,13 @@ static int ath6kl_cfg80211_sscan_start(struct wiphy *wiphy,
 		return ret;
 	}
 
-	ret = ath6kl_wmi_set_host_sleep_mode_cmd(ar->wmi, vif->fw_vif_idx,
-						 ATH6KL_HOST_MODE_ASLEEP);
-	if (ret) {
-		ath6kl_warn("Failed to enable host sleep mode for sched scan: %d\n",
-			    ret);
+	ret = ath6kl_wmi_enable_sched_scan_cmd(ar->wmi, vif->fw_vif_idx, true);
+	if (ret)
 		return ret;
-	}
 
-	ar->state = ATH6KL_STATE_SCHED_SCAN;
+	set_bit(SCHED_SCANNING, &vif->flags);
 
-	return ret;
+	return 0;
 }
 
 static int ath6kl_cfg80211_sscan_stop(struct wiphy *wiphy,
@@ -3369,11 +3607,63 @@ static int ath6kl_cfg80211_set_bitrate(struct wiphy *wiphy,
 					   mask);
 }
 
-static int ath6kl_notify_p2p_flush(struct wiphy *wiphy)
+static int ath6kl_set_mac_acl(struct wiphy *wiphy,
+			      struct net_device *dev,
+			      struct cfg80211_acl_params *acl_info)
 {
-	cfg80211_unlink_allbss(wiphy);
+	struct ath6kl *ar = ath6kl_priv(dev);
+	struct ath6kl_vif *vif = netdev_priv(dev);
+	int i, err;
+	static const u8 zero_mac[ETH_ALEN] = { 0 };
 
-	return 0;
+	/* Reset the acl list */
+	err = ath6kl_wmi_set_acl_list(ar->wmi, vif->fw_vif_idx, 0, zero_mac,
+				      acl_info->acl_policy, true);
+	if (err)
+		return err;
+
+	for (i = 0; i < acl_info->n_acl_entries; i++) {
+		err = ath6kl_wmi_set_acl_list(ar->wmi, vif->fw_vif_idx, i,
+					      acl_info->mac_addrs[i].addr,
+					      acl_info->acl_policy, false);
+		if (err)
+			return err;
+	}
+
+	/*
+	 * Notify fw of the state that the host is done with setting
+	 * the acl list. This is done with a special configuration
+	 * where the index of the mac address is passed as 0xff and
+	 * the mac address is zero mac. Firmware would carry out
+	 * certain operations based on the newly set acl list after
+	 * this notification.
+	 */
+	err = ath6kl_wmi_set_acl_list(ar->wmi, vif->fw_vif_idx,
+				      MAC_ACL_INDEX_EOL, zero_mac,
+				      acl_info->acl_policy, false);
+
+	return err;
+}
+
+static int ath6kl_cfg80211_set_txe_config(struct wiphy *wiphy,
+					  struct net_device *dev,
+					  u32 rate, u32 pkts, u32 intvl)
+{
+	struct ath6kl *ar = ath6kl_priv(dev);
+	struct ath6kl_vif *vif = netdev_priv(dev);
+
+	if (vif->nw_type != INFRA_NETWORK ||
+	    !test_bit(ATH6KL_FW_CAPABILITY_TX_ERR_NOTIFY, ar->fw_capabilities))
+		return -EOPNOTSUPP;
+
+	if (vif->sme_state != SME_CONNECTED)
+		return -ENOTCONN;
+
+	/* save this since the firmware won't report the interval */
+	vif->txe_intvl = intvl;
+
+	return ath6kl_wmi_set_txe_notify(ar->wmi, vif->fw_vif_idx,
+					 rate, pkts, intvl);
 }
 
 static const struct ieee80211_txrx_stypes
@@ -3444,11 +3734,16 @@ static struct cfg80211_ops ath6kl_cfg80211_ops = {
 	.sched_scan_start = ath6kl_cfg80211_sscan_start,
 	.sched_scan_stop = ath6kl_cfg80211_sscan_stop,
 	.set_bitrate_mask = ath6kl_cfg80211_set_bitrate,
-	.notify_p2p_flush = ath6kl_notify_p2p_flush,
+	.set_mac_acl = ath6kl_set_mac_acl,
+	.set_cqm_txe_config = ath6kl_cfg80211_set_txe_config,
 };
 
 void ath6kl_cfg80211_stop(struct ath6kl_vif *vif)
 {
+	struct ath6kl* ar = vif->ar;
+	u8 mac[ETH_ALEN];
+	int i;
+
 	ath6kl_cfg80211_sscan_disable(vif);
 
 	switch (vif->sme_state) {
@@ -3465,16 +3760,36 @@ void ath6kl_cfg80211_stop(struct ath6kl_vif *vif)
 		break;
 	}
 
-	if (test_bit(CONNECTED, &vif->flags) ||
-	    test_bit(CONNECT_PEND, &vif->flags))
+	if (vif->ar->state == ATH6KL_STATE_RECOVERY &&
+	    vif->nw_type == AP_NETWORK) {
+		for (i = 0; i < AP_MAX_NUM_STA; i++) {
+			if (is_zero_ether_addr(ar->sta_list[i].mac))
+				continue;
+			memcpy(mac, ar->sta_list[i].mac, ETH_ALEN);
+			if (!ath6kl_remove_sta(ar, mac,
+					       WMI_AP_REASON_FROM_HOST))
+				continue;
+			cfg80211_del_sta(vif->ndev, (const u8 *) mac,
+					 GFP_KERNEL);
+		}
+	}
+
+	if (vif->ar->state != ATH6KL_STATE_RECOVERY &&
+	    (test_bit(CONNECTED, &vif->flags) ||
+	    test_bit(CONNECT_PEND, &vif->flags)))
 		ath6kl_wmi_disconnect_cmd(vif->ar->wmi, vif->fw_vif_idx);
 
 	vif->sme_state = SME_DISCONNECTED;
 	clear_bit(CONNECTED, &vif->flags);
 	clear_bit(CONNECT_PEND, &vif->flags);
 
+	/* Stop netdev queues, needed during recovery */
+	netif_stop_queue(vif->ndev);
+	netif_carrier_off(vif->ndev);
+
 	/* disable scanning */
-	if (ath6kl_wmi_scanparams_cmd(vif->ar->wmi, vif->fw_vif_idx, 0xFFFF,
+	if (vif->ar->state != ATH6KL_STATE_RECOVERY &&
+	    ath6kl_wmi_scanparams_cmd(vif->ar->wmi, vif->fw_vif_idx, 0xFFFF,
 				      0, 0, 0, 0, 0, 0, 0, 0, 0) != 0)
 		ath6kl_warn("failed to disable scan during stop\n");
 
@@ -3486,7 +3801,7 @@ void ath6kl_cfg80211_stop_all(struct ath6kl *ar)
 	struct ath6kl_vif *vif;
 
 	vif = ath6kl_vif_first(ar);
-	if (!vif) {
+	if (!vif && ar->state != ATH6KL_STATE_RECOVERY) {
 		/* save the current power mode before enabling power save */
 		ar->wmi->saved_pwr_mode = ar->wmi->pwr_mode;
 
@@ -3504,6 +3819,51 @@ void ath6kl_cfg80211_stop_all(struct ath6kl *ar)
 	list_for_each_entry(vif, &ar->vif_list, list)
 		ath6kl_cfg80211_stop(vif);
 }
+
+#ifdef CONFIG_ATH6KL_REGDOMAIN
+static int ath6kl_cfg80211_reg_notify(struct wiphy *wiphy,
+				      struct regulatory_request *request)
+{
+	struct ath6kl *ar = wiphy_priv(wiphy);
+	u32 rates[IEEE80211_NUM_BANDS];
+	int ret, i;
+
+	ath6kl_dbg(ATH6KL_DBG_WLAN_CFG,
+		   "cfg reg_notify %c%c%s%s initiator %d\n",
+		   request->alpha2[0], request->alpha2[1],
+		   request->intersect ? " intersect" : "",
+		   request->processed ? " processed" : "",
+		   request->initiator);
+
+	ret = ath6kl_wmi_set_regdomain_cmd(ar->wmi, request->alpha2);
+	if (ret) {
+		ath6kl_err("failed to set regdomain: %d\n", ret);
+		return ret;
+	}
+
+	/*
+	 * Firmware will apply the regdomain change only after a scan is
+	 * issued and it will send a WMI_REGDOMAIN_EVENTID when it has been
+	 * changed.
+	 */
+
+	for (i = 0; i < IEEE80211_NUM_BANDS; i++)
+		if (wiphy->bands[i])
+			rates[i] = (1 << wiphy->bands[i]->n_bitrates) - 1;
+
+
+	ret = ath6kl_wmi_beginscan_cmd(ar->wmi, 0, WMI_LONG_SCAN, false,
+				       false, 0, ATH6KL_FG_SCAN_INTERVAL,
+				       0, NULL, false, rates);
+	if (ret) {
+		ath6kl_err("failed to start scan for a regdomain change: %d\n",
+			   ret);
+		return ret;
+	}
+
+	return 0;
+}
+#endif
 
 struct ath6kl *ath6kl_core_alloc(struct device *dev)
 {
@@ -3557,6 +3917,8 @@ struct ath6kl *ath6kl_core_alloc(struct device *dev)
 		skb_queue_head_init(&ar->sta_list[ctr].psq);
 		skb_queue_head_init(&ar->sta_list[ctr].apsdq);
 		ar->sta_list[ctr].mgmt_psq_len = 0;
+		ar->sta_list[ctr].apsdq_depth = 0;
+		ar->sta_list[ctr].psq_depth = 0;
 		INIT_LIST_HEAD(&ar->sta_list[ctr].mgmt_psq);
 		ar->sta_list[ctr].aggr_conn =
 			kzalloc(sizeof(struct aggr_info_conn), GFP_KERNEL);
@@ -3593,6 +3955,11 @@ int ath6kl_register_ieee80211_hw(struct ath6kl *ar)
 		wiphy->interface_modes |= BIT(NL80211_IFTYPE_P2P_GO) |
 					  BIT(NL80211_IFTYPE_P2P_CLIENT);
 	}
+
+#ifdef CONFIG_ATH6KL_REGDOMAIN
+	/* FIXME: add firmware capability */
+	wiphy->reg_notifier = ath6kl_cfg80211_reg_notify;
+#endif
 
 	/* max num of ssids that can be probed during scanning */
 	wiphy->max_scan_ssids = MAX_PROBED_SSIDS;
@@ -3633,6 +4000,11 @@ int ath6kl_register_ieee80211_hw(struct ath6kl *ar)
 	wiphy->max_sched_scan_ssids = MAX_PROBED_SSIDS;
 
 	ath6kl_setup_android_resource(ar);
+
+	if (test_bit(ATH6KL_FW_CAPABILITY_MAC_ACL, ar->fw_capabilities)) {
+		ar->wiphy->features |= NL80211_FEATURE_MAC_ACL;
+		ar->wiphy->max_acl_mac_addrs = MAX_ACL_MAC_ADDRS;
+	}
 
 	ret = wiphy_register(wiphy);
 	if (ret < 0) {
@@ -3684,6 +4056,10 @@ void ath6kl_deinit_if_data(struct ath6kl_vif *vif)
 	unregister_netdevice(vif->ndev);
 
 	ar->num_vif--;
+#ifdef SS_3RD_INTF
+	ar->p2p_active=false;
+	ar->scan_p2p = false;
+#endif
 }
 
 struct net_device *ath6kl_interface_add(struct ath6kl *ar, char *name,
@@ -3714,21 +4090,22 @@ struct net_device *ath6kl_interface_add(struct ath6kl *ar, char *name,
 	vif->htcap[IEEE80211_BAND_2GHZ].ht_enable = true;
 	vif->htcap[IEEE80211_BAND_5GHZ].ht_enable = true;
 
-	memset((u8 *)&vif->scparams, 0, sizeof(vif->scparams));
-	vif->scparams.bg_period = WLAN_CONFIG_BG_SCAN_INTERVAL;
-	vif->scparams.maxact_chdwell_time = WLAN_CONFIG_MAXACT_CHDWELL_TIME;
-	vif->scparams.pas_chdwell_time = WLAN_CONFIG_PASSIVE_CHDWELL_TIME;
-	vif->scparams.short_scan_ratio = WMI_SHORTSCANRATIO_DEFAULT;
-	vif->scparams.scan_ctrl_flags = DEFAULT_SCAN_CTRL_FLAGS;
-
-	vif->pspoll_num = WLAN_CONFIG_PSPOLL_NUM;
-	vif->mcastrate = WLAN_CONFIG_MCAST_RATE;
+	vif->remove_sta_recall = 0;
+	vif->disconnect_recall = 0;
 
 	memcpy(ndev->dev_addr, ar->mac_addr, ETH_ALEN);
 	if (fw_vif_idx != 0) {
+#ifdef SS_3RD_INTF
+		ndev->dev_addr[0] = (ndev->dev_addr[0] ^ (1 << 1)) |
+				     0x2;
+		if (fw_vif_idx == 2)
+#else
 		ndev->dev_addr[0] = (ndev->dev_addr[0] ^ (1 << fw_vif_idx)) |
 				     0x2;
-		ndev->dev_addr[4] = (ndev->dev_addr[4] ^ 0x80);
+		if (test_bit(ATH6KL_FW_CAPABILITY_CUSTOM_MAC_ADDR,
+			     ar->fw_capabilities))
+#endif
+			ndev->dev_addr[4] ^= 0x80;
 	}
 
 	init_netdev(ndev);

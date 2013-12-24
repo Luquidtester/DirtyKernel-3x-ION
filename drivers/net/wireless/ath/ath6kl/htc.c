@@ -1559,7 +1559,7 @@ static void htc_ctrl_rx(struct htc_target *context, struct htc_packet *packets)
 		ath6kl_err("htc_ctrl_rx, got message with len:%zu\n",
 			packets->act_len + HTC_HDR_LENGTH);
 
-		ath6kl_dbg_dump(ATH6KL_DBG_HTC,
+		ath6kl_dbg_dump(ATH6KL_DBG_WMI,
 				"htc rx unexpected endpoint 0 message", "",
 				packets->buf - HTC_HDR_LENGTH,
 				packets->act_len + HTC_HDR_LENGTH);
@@ -1837,9 +1837,9 @@ static int ath6kl_htc_rx_process_hdr(struct htc_target *target,
 	if (lk_ahd != packet->info.rx.exp_hdr) {
 		ath6kl_err("%s(): lk_ahd mismatch! (pPkt:0x%p flags:0x%X)\n",
 			   __func__, packet, packet->info.rx.rx_flags);
-		ath6kl_dbg_dump(ATH6KL_DBG_HTC, "htc rx expected lk_ahd",
+		ath6kl_dbg_dump(ATH6KL_DBG_WMI, "htc rx expected lk_ahd",
 				"", &packet->info.rx.exp_hdr, 4);
-		ath6kl_dbg_dump(ATH6KL_DBG_HTC, "htc rx current header",
+		ath6kl_dbg_dump(ATH6KL_DBG_WMI, "htc rx current header",
 				"", (u8 *)&lk_ahd, sizeof(lk_ahd));
 		status = -ENOMEM;
 		goto fail_rx;
@@ -1875,7 +1875,7 @@ static int ath6kl_htc_rx_process_hdr(struct htc_target *target,
 
 fail_rx:
 	if (status)
-		ath6kl_dbg_dump(ATH6KL_DBG_HTC, "htc rx bad packet",
+		ath6kl_dbg_dump(ATH6KL_DBG_WMI, "htc rx bad packet",
 				"", packet->buf, packet->act_len);
 
 	return status;
@@ -2474,7 +2474,8 @@ int ath6kl_htc_conn_service(struct htc_target *target,
 		max_msg_sz = le16_to_cpu(resp_msg->max_msg_sz);
 	}
 
-	if (assigned_ep >= ENDPOINT_MAX || !max_msg_sz) {
+	if (WARN_ON_ONCE(assigned_ep == ENDPOINT_UNUSED ||
+			 assigned_ep >= ENDPOINT_MAX || !max_msg_sz)) {
 		status = -ENOMEM;
 		goto fail_tx;
 	}
@@ -2506,6 +2507,9 @@ int ath6kl_htc_conn_service(struct htc_target *target,
 	switch (endpoint->svc_id) {
 	case WMI_DATA_BK_SVC:
 		endpoint->tx_drop_packet_threshold = MAX_DEF_COOKIE_NUM / 3;
+		break;
+	case WMI_DATA_VO_SVC:
+		endpoint->tx_drop_packet_threshold = DATA_SYNC_RESERVED;
 		break;
 	default:
 		endpoint->tx_drop_packet_threshold = MAX_HI_COOKIE_NUM;

@@ -26,21 +26,20 @@
 #include "target.h"
 #include "debug.h"
 #include "hif-ops.h"
+#include "regd.h"
 #include "pm.h"
 
-unsigned int debug_mask = ATH6KL_DBG_WMI | ATH6KL_DBG_BOOT |
-			ATH6KL_DBG_WLAN_CFG | ATH6KL_DBG_SUSPEND |
-			ATH6KL_DBG_TRC;
+unsigned int debug_mask = ATH6KL_DBG_BMI | ATH6KL_DBG_WMI | ATH6KL_DBG_SUSPEND | ATH6KL_DBG_BOOT | ATH6KL_DBG_WLAN_CFG | ATH6KL_DBG_TRC;
 static unsigned int testmode;
-
-/* WoW2 (deepsleep), Suspend (WoW) */
+/* Set WOW mode as default suspend mode */
 static unsigned int suspend_mode = WLAN_POWER_STATE_WOW;
 static unsigned int wow_mode = WLAN_POWER_STATE_DEEP_SLEEP;
 static unsigned int uart_debug;
 static unsigned int ar6k_clock = 19200000;
-static unsigned short reg_domain = 0xffff;
 static unsigned short locally_administered_bit;
 static unsigned short lrssi = 10;
+static unsigned int recovery_enable;
+static unsigned int heart_beat_poll = 2000;
 
 module_param(debug_mask, uint, 0644);
 module_param(testmode, uint, 0644);
@@ -48,9 +47,13 @@ module_param(suspend_mode, uint, 0644);
 module_param(wow_mode, uint, 0644);
 module_param(uart_debug, uint, 0644);
 module_param(ar6k_clock, uint, 0644);
-module_param(reg_domain, ushort, 0644);
 module_param(locally_administered_bit, ushort, 0644);
+module_param(recovery_enable, uint, 0644);
+module_param(heart_beat_poll, uint, 0644);
 module_param(lrssi, ushort, 0644);
+MODULE_PARM_DESC(heart_beat_poll, "Enable fw error detection periodic" \
+		 "polling. This also specifies the polling interval in msecs");
+MODULE_PARM_DESC(recovery_enable, "Enable recovery from firmware error");
 
 static const struct ath6kl_hw hw_list[] = {
 	{
@@ -170,68 +173,9 @@ static const struct ath6kl_hw hw_list[] = {
  */
 #define WLAN_CONFIG_DISCONNECT_TIMEOUT 10
 
+extern  int android_readwrite_file(const char *filename, char *rbuf, const char *wbuf, size_t length);
 
 #define ATH6KL_DATA_OFFSET    64
-
-typedef char            A_CHAR;
-extern int android_readwrite_file(const A_CHAR *filename, A_CHAR *rbuf, const A_CHAR *wbuf, size_t length);
-
- /*
- * Number of bytes in board data that we are interested
- * in while setting regulatory domain from host
- */
-#define REG_DMN_BOARD_DATA_LEN	16
-
-/* Modifies regulatory domain in board data in target RAM */
-static int ath6kl_set_reg_dmn(struct ath6kl *ar)
-{
-	u8 buf[REG_DMN_BOARD_DATA_LEN];
-	__le16 old_sum, old_ver, old_rd, old_rd_next;
-	__le32 brd_dat_addr = 0, new_sum, new_rd;
-	int ret;
-
-	ret = ath6kl_bmi_read(ar, AR6003_BOARD_DATA_ADDR,
-			      (u8 *)&brd_dat_addr, 4);
-	if (ret)
-		return ret;
-
-	memset(buf, 0, sizeof(buf));
-	ret = ath6kl_bmi_read(ar, brd_dat_addr, buf, sizeof(buf));
-	if (ret)
-		return ret;
-
-	memcpy((u8 *)&old_sum, buf + AR6003_BOARD_DATA_OFFSET, 2);
-	memcpy((u8 *)&old_ver, buf + AR6003_BOARD_DATA_OFFSET + 2, 2);
-	memcpy((u8 *)&old_rd, buf + AR6003_RD_OFFSET, 2);
-	memcpy((u8 *)&old_rd_next, buf + AR6003_RD_OFFSET + 2, 2);
-
-	/*
-	 * Overwrite the new regulatory domain and preserve the
-	 * MAC addr which is in the same word.
-	 */
-	new_rd = cpu_to_le32((le32_to_cpu(old_rd_next) << 16) + reg_domain);
-	ret = ath6kl_bmi_write(ar,
-		cpu_to_le32(le32_to_cpu(brd_dat_addr) + AR6003_RD_OFFSET),
-		(u8 *)&new_rd, 4);
-	if (ret)
-		return ret;
-
-	/*
-	 * Recompute the board data checksum with the new regulatory
-	 * domain, preserve the version information which is in the
-	 * same word.
-	 */
-	new_sum = cpu_to_le32((le32_to_cpu(old_ver) << 16) +
-			      (le32_to_cpu(old_sum) ^ le32_to_cpu(old_rd) ^
-			       reg_domain));
-	ret = ath6kl_bmi_write(ar,
-		cpu_to_le32(le32_to_cpu(brd_dat_addr) +
-		AR6003_BOARD_DATA_OFFSET),
-		(u8 *)&new_sum, 4);
-
-	return ret;
-}
-
 struct sk_buff *ath6kl_buf_alloc(int size)
 {
 	struct sk_buff *skb;
@@ -385,7 +329,7 @@ static int ath6kl_init_service_ep(struct ath6kl *ar)
 	 */
 	connect.conn_flags |= HTC_CONN_FLGS_REDUCE_CRED_DRIB;
 	connect.conn_flags &= ~HTC_CONN_FLGS_THRESH_MASK;
-	connect.conn_flags |= HTC_CONN_FLGS_THRESH_LVL_HALF;
+	connect.conn_flags |= HTC_CONN_FLGS_THRESH_LVL_QUAT;
 
 	connect.svc_id = WMI_DATA_BE_SVC;
 
@@ -495,20 +439,12 @@ static int ath6kl_target_config_wlan_params(struct ath6kl *ar, int idx)
 		status = -EIO;
 	}
 
-	if (ar->conf_flags & ATH6KL_CONF_IGNORE_PS_FAIL_EVT_IN_SCAN) {
-		if ((ath6kl_wmi_pmparams_cmd(ar->wmi, idx,
-			0, vif->pspoll_num, 0, 0, 1,
-			IGNORE_POWER_SAVE_FAIL_EVENT_DURING_SCAN)) != 0) {
-			ath6kl_err("unable to set power save fail event policy during scan\n");
+	if (ar->conf_flags & ATH6KL_CONF_IGNORE_PS_FAIL_EVT_IN_SCAN)
+		if ((ath6kl_wmi_pmparams_cmd(ar->wmi, idx, 0, 1, 0, 0, 1,
+		     IGNORE_POWER_SAVE_FAIL_EVENT_DURING_SCAN)) != 0) {
+			ath6kl_err("unable to set power save fail event policy\n");
 			status = -EIO;
 		}
-	} else {
-		if ((ath6kl_wmi_pmparams_cmd(ar->wmi, idx, 0,
-				 vif->pspoll_num, 0, 0, 1, 0)) != 0) {
-			ath6kl_err("unable to set pm params\n");
-			status = -EIO;
-		}
-	}
 
 	if (!(ar->conf_flags & ATH6KL_CONF_IGNORE_ERP_BARKER))
 		if ((ath6kl_wmi_set_lpreamble_cmd(ar->wmi, idx, 0,
@@ -558,25 +494,6 @@ static int ath6kl_target_config_wlan_params(struct ath6kl *ar, int idx)
 	}
 
 	if (vif->nw_type == INFRA_NETWORK) {
-		ath6kl_dbg(ATH6KL_DBG_TRC, "bg scan interval = %d, active dwell time = %d, passive dwell time = %d\n",
-			vif->scparams.bg_period,
-			vif->scparams.maxact_chdwell_time,
-			vif->scparams.pas_chdwell_time);
-
-		status = ath6kl_wmi_scanparams_cmd(ar->wmi, idx,
-		    vif->scparams.fg_start_period,
-		    vif->scparams.fg_end_period, vif->scparams.bg_period,
-		    vif->scparams.minact_chdwell_time,
-		    vif->scparams.maxact_chdwell_time,
-			vif->scparams.pas_chdwell_time,
-			vif->scparams.short_scan_ratio,
-			vif->scparams.scan_ctrl_flags,
-			vif->scparams.max_dfsch_act_time,
-			vif->scparams.maxact_scan_per_ssid);
-		if (status) {
-			ath6kl_dbg(ATH6KL_DBG_TRC,
-			"failed to set scanparams""(%d)\n", status);
-		}
 		status = ath6kl_wmi_set_roam_lrssi_cmd(ar->wmi, lrssi);
 		if (status) {
 			ath6kl_dbg(ATH6KL_DBG_TRC,
@@ -679,6 +596,31 @@ int ath6kl_configure_target(struct ath6kl *ar)
 
 	ath6kl_dbg(ATH6KL_DBG_TRC, "firmware mode set\n");
 
+#ifdef SS_3RD_INTF
+	param = 0;
+
+	if (ath6kl_bmi_read(ar,
+			    ath6kl_get_hi_item_addr(ar,
+			    HI_ITEM(hi_option_flag2)),
+			    (u8 *)&param, 4) != 0) {
+		ath6kl_err("bmi_read_memory for setting virtual"
+			   " MAC address failed\n");
+		return -EIO;
+	}
+
+	param |= HI_OPTION_VIRTU_MAC_ENABLE;
+
+	if (ath6kl_bmi_write(ar,
+			     ath6kl_get_hi_item_addr(ar,
+			     HI_ITEM(hi_option_flag2)),
+			     (u8 *)&param,
+			     4) != 0) {
+		ath6kl_err("bmi_write_memory for setting virtual"
+			   " MAC address failed\n");
+		return -EIO;
+	}
+#endif
+
 	/*
 	 * Hardcode the address use for the extended board data
 	 * Ideally this should be pre-allocate by the OS at boot time
@@ -740,6 +682,8 @@ void ath6kl_core_cleanup(struct ath6kl *ar)
 {
 	ath6kl_hif_power_off(ar);
 
+	ath6kl_recovery_cleanup(ar);
+
 	destroy_workqueue(ar->ath6kl_wq);
 
 	if (ar->htc_target)
@@ -753,11 +697,11 @@ void ath6kl_core_cleanup(struct ath6kl *ar)
 
 	ath6kl_debug_cleanup(ar);
 
-	vfree(ar->fw_board);
-	vfree(ar->fw_otp);
+	kfree(ar->fw_board);
+	kfree(ar->fw_otp);
 	vfree(ar->fw);
-	vfree(ar->fw_patch);
-	vfree(ar->fw_testscript);
+	kfree(ar->fw_patch);
+	kfree(ar->fw_testscript);
 
 	ath6kl_deinit_ieee80211_hw(ar);
 }
@@ -774,16 +718,11 @@ static int ath6kl_get_fw(struct ath6kl *ar, const char *filename,
 		return ret;
 
 	*fw_len = fw_entry->size;
-	*fw = vmalloc(fw_entry->size);
+	*fw = kmemdup(fw_entry->data, fw_entry->size, GFP_KERNEL);
 
-	if (*fw == NULL) {
+	if (*fw == NULL)
 		ret = -ENOMEM;
-		goto out;
-	}
 
-	memcpy(*fw, fw_entry->data, fw_entry->size);
-
-out:
 	release_firmware(fw_entry);
 
 	return ret;
@@ -1099,18 +1038,25 @@ static int ath6kl_fetch_fw_apin(struct ath6kl *ar, const char *name)
 		}
 
 		switch (ie_id) {
+		case ATH6KL_FW_IE_FW_VERSION:
+			strlcpy(ar->wiphy->fw_version, data,
+				sizeof(ar->wiphy->fw_version));
+
+			ath6kl_dbg(ATH6KL_DBG_BOOT,
+				   "found fw version %s\n",
+				    ar->wiphy->fw_version);
+			break;
 		case ATH6KL_FW_IE_OTP_IMAGE:
 			ath6kl_dbg(ATH6KL_DBG_BOOT, "found otp image ie (%zd B)\n",
 				ie_len);
 
-			ar->fw_otp = vmalloc(ie_len);
+			ar->fw_otp = kmemdup(data, ie_len, GFP_KERNEL);
 
 			if (ar->fw_otp == NULL) {
 				ret = -ENOMEM;
 				goto out;
 			}
 
-			memcpy(ar->fw_otp, data, ie_len);
 			ar->fw_otp_len = ie_len;
 			break;
 		case ATH6KL_FW_IE_FW_IMAGE:
@@ -1127,6 +1073,7 @@ static int ath6kl_fetch_fw_apin(struct ath6kl *ar, const char *name)
 				ret = -ENOMEM;
 				goto out;
 			}
+
 			memcpy(ar->fw, data, ie_len);
 			ar->fw_len = ie_len;
 			break;
@@ -1134,14 +1081,13 @@ static int ath6kl_fetch_fw_apin(struct ath6kl *ar, const char *name)
 			ath6kl_dbg(ATH6KL_DBG_BOOT, "found patch image ie (%zd B)\n",
 				ie_len);
 
-			ar->fw_patch = vmalloc(ie_len);
+			ar->fw_patch = kmemdup(data, ie_len, GFP_KERNEL);
 
 			if (ar->fw_patch == NULL) {
 				ret = -ENOMEM;
 				goto out;
 			}
 
-			memcpy(ar->fw_patch, data, ie_len);
 			ar->fw_patch_len = ie_len;
 			break;
 		case ATH6KL_FW_IE_RESERVED_RAM_SIZE:
@@ -1153,9 +1099,6 @@ static int ath6kl_fetch_fw_apin(struct ath6kl *ar, const char *name)
 				   ar->hw.reserved_ram_size);
 			break;
 		case ATH6KL_FW_IE_CAPABILITIES:
-			if (ie_len < DIV_ROUND_UP(ATH6KL_FW_CAPABILITY_MAX, 8))
-				break;
-
 			ath6kl_dbg(ATH6KL_DBG_BOOT,
 				   "found firmware capabilities ie (%zd B)\n",
 				   ie_len);
@@ -1163,6 +1106,9 @@ static int ath6kl_fetch_fw_apin(struct ath6kl *ar, const char *name)
 			for (i = 0; i < ATH6KL_FW_CAPABILITY_MAX; i++) {
 				index = i / 8;
 				bit = i % 8;
+
+				if (index == ie_len)
+					break;
 
 				if (data[index] & (1 << bit))
 					__set_bit(i, ar->fw_capabilities);
@@ -1218,6 +1164,8 @@ static int ath6kl_fetch_fw_apin(struct ath6kl *ar, const char *name)
 		data += ie_len;
 	};
 
+	__set_bit(ATH6KL_FW_CAPABILITY_MAC_ACL, ar->fw_capabilities);
+
 	ret = 0;
 out:
 	release_firmware(fw);
@@ -1236,6 +1184,12 @@ static int ath6kl_fetch_firmwares(struct ath6kl *ar)
 	ret = ath6kl_fetch_testmode_file(ar);
 	if (ret)
 		return ret;
+
+	ret = ath6kl_fetch_fw_apin(ar, ATH6KL_FW_API4_FILE);
+	if (ret == 0) {
+		ar->fw_api = 4;
+		goto out;
+	}
 
 	ret = ath6kl_fetch_fw_apin(ar, ATH6KL_FW_API3_FILE);
 	if (ret == 0) {
@@ -1415,7 +1369,7 @@ static int ath6kl_upload_otp(struct ath6kl *ar)
 	ath6kl_dbg(ATH6KL_DBG_BOOT, "executing OTP at 0x%x\n",
 		   ar->hw.app_start_override_addr);
 
-#ifdef CONFIG_MACH_MSM7X27A_FFA
+#ifdef CONFIG_MACH_PX
 	/* SOFTMAC has higher priority than OTP MAC */
 	param = 1;
 #else
@@ -1530,172 +1484,6 @@ static int ath6kl_upload_testscript(struct ath6kl *ar)
 	return 0;
 }
 
-#ifdef GLOBALCONFIG_WLAN_COUNTRY_CODE
-#define COUNTRY_MAX 79
-struct channels {
-	char country[30];
-	char ccode[6];
-	unsigned short reg_dmn_code;
-}
-pArray[COUNTRY_MAX] = {
-	{"Afghanistan",		"AF 0",	0x406a},
-	{"Albania",			"AL 0",	0x8008},
-	{"Algeria",			"DZ 0",	0x800c},
-	{"Angola",			"AD 0",	0x406a},
-	{"Austria",			"AT 0",	0x8028},
-	{"Australia",		"AU 0",	0x8024},
-	{"Bangladesh",		"BD 0",	0x8032},
-	{"Belgium",			"BE 0",	0x8038},
-	{"Bosnia",			"BA 0",	0x8046},
-	{"Bulgaria",		"BG 0",	0x8064},
-	{"Croatia",			"HR 0",	0x80bf},
-	{"Greece",			"GR 0",	0x812c},
-	{"Czech Republic",	"CZ 0",	0x80cb},
-	{"Egypt",			"EG 0",	0x8332},
-	{"Nordic",			"FI 0",	0x80f6},
-	{"Finland",			"FI 0",	0x80f6},
-	{"France",			"FR 0",	0x80FA},
-	{"Gabon",			"GA 0",	0x406a},
-	{"Germany",			"DE 0",	0x8114},
-	{"Ghana",			"GH 0",	0x406a},
-	{"Greece",			"GR 0",	0x812c},
-	{"Hungary",			"HU 0",	0x815c},
-	{"Iceland",			"IS 0",	0x8160},
-	{"India",			"IN 0",	0x8164},
-	{"Indonesia",		"ID 0",	0x8168},
-	{"Iraq",			"IQ 0",	0x406a},
-	{"IE",				"IE 0",	0x8174},
-	{"Ireland",			"IE 0",	0x8174},
-	{"Israel",			"IL 0",	0x8178},
-	{"Italy",			"IT 0",	0x817c},
-	{"Jamaica",			"JM 0",	0x8184},
-	{"Jordan",			"JO 0",	0x8190},
-	{"Central Asia",	"KZ 0",	0x818e},
-	{"Kazakhstan",		"KZ 0",	0x818e},
-	{"Kenya",			"KE 0",	0x8198},
-	{"BALTIC",			"LV 0",	0x81ac},
-	{"Libya",			"LY 0",	0x406a},
-	{"Lithuania",		"LT 0",	0x81b8},
-	{"Luxemburg",		"LU 0",	0x81ba},
-	{"Macedonia",		"MK 0",	0x8327},
-	{"Malaysia",		"MY 0",	0x81ca},
-	{"Mongolia",		"MN 0",	0x406a},
-	{"Montenegro",		"ME 0",	0x837b},
-	{"Morocco",			"MA 0",	0x81f8},
-	{"Nepal",			"NP 0",	0x820c},
-	{"Netherlands",		"NL 0",	0x8210},
-	{"The Netherlands",	"NL 0",	0x8210},
-	{"New Zealand",		"NZ 0",	0x822a},
-	{"Nigeria",			"NG 0",	0x406a},
-	{"Norway",			"NO 0",	0x8242},
-	{"Pakistan",		"PK 0",	0x824a},
-	{"Philippines",		"PH 0",	0x8260},
-	{"Poland",			"PL 0",	0x8268},
-	{"Portugal",		"PT 0",	0x826c},
-	{"Romania",			"RO 0",	0x8282},
-	{"Russia",			"RU 0",	0x8283},
-	{"KSA",				"SA 0",	0x82aa},
-	{"Senegal",			"SN 0",	0x406a},
-	{"Serbia",			"RS 0",	0x8114},
-	{"Singapore",		"SG 0",	0x82be},
-	{"Slovakia",		"SK 0",	0x82bf},
-	{"Slovenia",		"SI 0",	0x82c1},
-	{"South Africa",	"ZA 0",	0x82c6},
-	{"Spain",			"ES 0",	0x82D4},
-	{"Sri Lanka",		"LK 0",	0x8090},
-	{"Sweden",			"SE 0",	0x82f0},
-	{"Switzerland",		"CH 0",	0x82f4},
-	{"Thailand",		"TH 0",	0x82fc},
-	{"Tunisia",			"TN 0",	0x8314},
-	{"Turkey",			"TR 0",	0x8318},
-	{"Ukraine",			"UA 0",	0x8324},
-	{"UK",				"GB 0",	0x833A},
-	{"UK &IRE",			"GB 0",	0x833A},
-	{"United Kingdom",	"GB 0",	0x833A},
-	{"Uzbekistan",		"UZ 0",	0x835c},
-	{"Vietnam",			"VN 0",	0x82c0},
-	{"China",				"CN 0", 0x809C},
-	{"Taiwan",			"TW 2", 0x809E},
-	{"Hong Kong",		"HK 0", 0x8158}
-
-};
-
-static unsigned short ath6kl_get_reg_dmn_code(u8 *ccode)
-{
-	int i = 0;
-
-	for (i = 0; i < COUNTRY_MAX; i++) {
-		if (strncmp(ccode, pArray[i].ccode, 2) == 0) {
-			ath6kl_dbg(ATH6KL_DBG_BOOT, "%s: %s %s 0x%x",
-				__func__, pArray[i].country, pArray[i].ccode,
-				pArray[i].reg_dmn_code);
-			return pArray[i].reg_dmn_code;
-		}
-	}
-
-	ath6kl_err("%s() Failed to find reg_domain code for %s\n",
-		__func__, ccode);
-
-	return 0xffff;
-}
-
-static void ath6kl_update_ccodeinfo(struct ath6kl *ar)
-{
-	char ccode_filename[32];
-
-	do {
-		int ret = 0;
-		size_t length;
-		u8 *pdata = NULL;
-
-		snprintf(ccode_filename, sizeof(ccode_filename),
-			"/data/.ccode.info");
-
-		ret = android_readwrite_file(ccode_filename, NULL, NULL, 0);
-
-		if (ret < 0){
-			ath6kl_dbg(ATH6KL_DBG_BOOT,
-				"%s: Cannot read ccode file\n",
-				__func__);
-
-			break;
-		}
-		else
-			length = ret;
-
-		pdata = vmalloc(length + 1);
-
-		if (!pdata) {
-			ath6kl_dbg(ATH6KL_DBG_BOOT,
-				"%s: Cannot allocate buffer for ccode_info (%d)\n",
-				__func__, length);
-			break;
-		}
-
-		if (android_readwrite_file(ccode_filename,
-				(char *)pdata, NULL, length) != length) {
-			ath6kl_dbg(ATH6KL_DBG_BOOT,
-				"%s: file read error, length %d\n",
-				__func__, length);
-			vfree(pdata);
-			break;
-		}
-		pdata[length] = '\0';
-
-		ath6kl_dbg(ATH6KL_DBG_BOOT,
-				"%s: pdata is  %s\n",
-				__func__, pdata);
-		if (reg_domain == 0xffff)
-			reg_domain = ath6kl_get_reg_dmn_code(pdata);
-
-		ath6kl_dbg(ATH6KL_DBG_BOOT,
-				"%s: reg_domain is  0x%x\n",
-				__func__, reg_domain);
-		vfree(pdata);
-	} while (0);
-}
-#endif
-
 static void ath6kl_update_psminfo(struct ath6kl *ar)
 {
 	char psm_filename[32];
@@ -1719,16 +1507,16 @@ static void ath6kl_update_psminfo(struct ath6kl *ar)
 
 		if (!pdata) {
 			ath6kl_dbg(ATH6KL_DBG_BOOT,
-				"%s: Cannot allocate buffer for psm_info (%d)\n",
-				__func__, length);
+					"%s: Cannot allocate buffer for psm_info (%d)\n",
+					__func__, length);
 			break;
 		}
 
 		if (android_readwrite_file(psm_filename,
-				(char *)pdata, NULL, length) != length) {
+					(char *)pdata, NULL, length) != length) {
 			ath6kl_dbg(ATH6KL_DBG_BOOT,
-				"%s: file read error, length %d\n",
-				__func__, length);
+					"%s: file read error, length %d\n",
+					__func__, length);
 			vfree(pdata);
 			break;
 		}
@@ -1923,7 +1711,7 @@ static const char *ath6kl_init_get_hif_name(enum ath6kl_hif_type type)
 	return NULL;
 }
 
-int ath6kl_init_hw_start(struct ath6kl *ar)
+static int __ath6kl_init_hw_start(struct ath6kl *ar)
 {
 	long timeleft;
 	int ret, i;
@@ -1942,11 +1730,8 @@ int ath6kl_init_hw_start(struct ath6kl *ar)
 	if (ret)
 		goto err_power_off;
 
-	if (reg_domain != 0xffff) {
-		ret = ath6kl_set_reg_dmn(ar);
-		if (ret)
+	if (ath6kl_set_reg_dmn(ar))
 			goto err_power_off;
-	}
 
 	/* Do we need to finish the BMI phase */
 	/* FIXME: return error from ath6kl_bmi_done() */
@@ -2007,8 +1792,8 @@ int ath6kl_init_hw_start(struct ath6kl *ar)
 	}
 
 	if (!timeleft || signal_pending(current)) {
-		ath6kl_err("wmi is not ready or wait was interrupted\n");
 		clear_bit(WMI_READY, &ar->flag);
+		ath6kl_err("wmi is not ready or wait was interrupted\n");
 		ret = -EIO;
 		goto err_htc_stop;
 	}
@@ -2026,8 +1811,6 @@ int ath6kl_init_hw_start(struct ath6kl *ar)
 			goto err_htc_stop;
 	}
 
-	ar->state = ATH6KL_STATE_ON;
-
 	return 0;
 
 err_htc_stop:
@@ -2040,7 +1823,18 @@ err_power_off:
 	return ret;
 }
 
-int ath6kl_init_hw_stop(struct ath6kl *ar)
+int ath6kl_init_hw_start(struct ath6kl *ar)
+{
+	int err;
+
+	err = __ath6kl_init_hw_start(ar);
+	if (err)
+		return err;
+	ar->state = ATH6KL_STATE_ON;
+	return 0;
+}
+
+static int __ath6kl_init_hw_stop(struct ath6kl *ar)
 {
 	int ret;
 
@@ -2056,8 +1850,17 @@ int ath6kl_init_hw_stop(struct ath6kl *ar)
 	if (ret)
 		ath6kl_warn("failed to power off hif: %d\n", ret);
 
-	ar->state = ATH6KL_STATE_OFF;
+	return 0;
+}
 
+int ath6kl_init_hw_stop(struct ath6kl *ar)
+{
+	int err;
+
+	err = __ath6kl_init_hw_stop(ar);
+	if (err)
+		return err;
+	ar->state = ATH6KL_STATE_OFF;
 	return 0;
 }
 
@@ -2066,7 +1869,9 @@ int ath6kl_core_init(struct ath6kl *ar)
 	struct ath6kl_bmi_target_info targ_info;
 	struct net_device *ndev;
 	int ret = 0, i;
-
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,0,0))
+	struct net_device *ndev_p2p0;
+#endif
 	ar->ath6kl_wq = create_singlethread_workqueue("ath6kl");
 	if (!ar->ath6kl_wq)
 		return -ENOMEM;
@@ -2106,13 +1911,9 @@ int ath6kl_core_init(struct ath6kl *ar)
 	ret = ath6kl_fetch_firmwares(ar);
 	if (ret)
 		goto err_htc_cleanup;
-
 	ath6kl_mangle_mac_address(ar, locally_administered_bit);
+
 	ath6kl_update_psminfo(ar);
-#ifdef GLOBALCONFIG_WLAN_COUNTRY_CODE
-	ath6kl_dbg(ATH6KL_DBG_TRC, "ath6kl_update_ccodeinfo\n");
-	ath6kl_update_ccodeinfo(ar);
-#endif
 
 	/* FIXME: we should free all firmwares in the error cases below */
 
@@ -2189,10 +1990,11 @@ int ath6kl_core_init(struct ath6kl *ar)
 
 	ar->wiphy->flags |= WIPHY_FLAG_SUPPORTS_FW_ROAM |
 			    WIPHY_FLAG_HAVE_AP_SME |
-			    WIPHY_FLAG_AP_PROBE_RESP_OFFLOAD;
+			    WIPHY_FLAG_AP_PROBE_RESP_OFFLOAD |
+			    WIPHY_FLAG_SUPPORTS_ACS;
 
-/* for disable sched scan comment out
-	if (test_bit(ATH6KL_FW_CAPABILITY_SCHED_SCAN, ar->fw_capabilities))
+/* disable scheduled scanning.
+	if (test_bit(ATH6KL_FW_CAPABILITY_SCHED_SCAN_V2, ar->fw_capabilities))
 		ar->wiphy->flags |= WIPHY_FLAG_SUPPORTS_SCHED_SCAN;
 */
 
@@ -2224,6 +2026,28 @@ int ath6kl_core_init(struct ath6kl *ar)
 	 */
 	memcpy(ndev->dev_addr, ar->mac_addr, ETH_ALEN);
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,0,0))
+	rtnl_lock();
+	ndev_p2p0 = ath6kl_cfg80211_add_p2p0_iface(ar);
+	rtnl_unlock();
+
+	if (!ndev_p2p0) {
+		ath6kl_err("Failed to create p2p0 iface\n");
+		ret = -ENOMEM;
+		goto err_rxbuf_cleanup;
+	}
+#endif
+	ar->fw_recovery.enable = !!recovery_enable;
+	if (!ar->fw_recovery.enable)
+		return ret;
+
+	if (heart_beat_poll &&
+	    test_bit(ATH6KL_FW_CAPABILITY_HEART_BEAT_POLL,
+		     ar->fw_capabilities))
+		ar->fw_recovery.hb_poll = heart_beat_poll;
+
+	ath6kl_recovery_init(ar);
+
 	return ret;
 
 err_rxbuf_cleanup:
@@ -2250,6 +2074,25 @@ err_wq:
 	destroy_workqueue(ar->ath6kl_wq);
 
 	return ret;
+}
+
+void ath6kl_init_hw_restart(struct ath6kl *ar)
+{
+	clear_bit(WMI_READY, &ar->flag);
+
+	ath6kl_cfg80211_stop_all(ar);
+
+	if (__ath6kl_init_hw_stop(ar)) {
+		ath6kl_dbg(ATH6KL_DBG_RECOVERY, "Failed to stop during fw error recovery\n");
+		return;
+	}
+
+	if (__ath6kl_init_hw_start(ar)) {
+		ath6kl_dbg(ATH6KL_DBG_RECOVERY, "Failed to restart during fw error recovery\n");
+		return;
+	}
+
+	ath6kl_cfg80211_start_all(ar);
 }
 
 void ath6kl_cleanup_vif(struct ath6kl_vif *vif, bool wmi_ready)
