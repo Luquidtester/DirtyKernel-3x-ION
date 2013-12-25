@@ -44,7 +44,7 @@
 #include <linux/power_supply.h>
 #include <linux/regulator/consumer.h>
 #include <mach/rpc_pmapp.h>
-#include <mach/msm_battery_jena.h>
+#include <mach/msm_battery.h>
 #include <linux/smsc911x.h>
 #include <linux/ion.h>
 #include "devices.h"
@@ -52,14 +52,17 @@
 #include "board-msm7x27a-regulator.h"
 #include "devices-msm7x2xa.h"
 #include "pm.h"
+
 #ifdef CONFIG_SAMSUNG_JACK
 #include <linux/sec_jack.h>
 #endif
+
 #include <mach/rpc_server_handset.h>
 #include <mach/socinfo.h>
 #include <linux/fsaxxxx_usbsw.h>
 #include "proc_comm.h"
 #include "pm-boot.h"
+
 #ifdef CONFIG_PROXIMITY_SENSOR
 #include <linux/gp2a.h>
 #endif
