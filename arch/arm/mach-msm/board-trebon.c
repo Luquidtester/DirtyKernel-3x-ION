@@ -52,17 +52,14 @@
 #include "board-msm7x27a-regulator.h"
 #include "devices-msm7x2xa.h"
 #include "pm.h"
-
 #ifdef CONFIG_SAMSUNG_JACK
 #include <linux/sec_jack.h>
 #endif
-
 #include <mach/rpc_server_handset.h>
 #include <mach/socinfo.h>
 #include <linux/fsaxxxx_usbsw.h>
 #include "proc_comm.h"
 #include "pm-boot.h"
-
 #ifdef CONFIG_PROXIMITY_SENSOR
 #include <linux/gp2a.h>
 #endif
