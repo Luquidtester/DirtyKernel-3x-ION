@@ -29,7 +29,7 @@
 #define	TS_DRVIER_VERSION		"3.0.16"
 
 /* select touch mode : 0 is recommended*/
-#define	TOUCH_MODE			0
+#define	TOUCH_MODE				0
 
 /* if you want to use firmware setting, set this value.
 interrupt mask / button num / finger num */
@@ -43,11 +43,11 @@ interrupt mask / button num / finger num */
 
 /* max 8 */
 #define	MAX_SUPPORTED_BUTTON_NUM	8
-#define	SUPPORTED_BUTTON_NUM		2
+#define	SUPPORTED_BUTTON_NUM		4
 
 /* Upgrade Method*/
 #define	TOUCH_ONESHOT_UPGRADE		1
-#define	TOUCH_FORCE_UPGRADE		0
+#define	TOUCH_FORCE_UPGRADE			1
 /* if you use isp mode, you must add i2c device :
 name = "zinitix_isp" , addr 0x50*/
 #define	TOUCH_USING_ISP_METHOD		1
@@ -320,5 +320,4 @@ struct _reg_ioctl {
 #define zinitix_swap_16(s) (((((s) & 0xff) << 8) | (((s) >> 8) & 0xff)))
 
 #endif /*ZINITIX_HEADER*/
-
 
